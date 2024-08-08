@@ -7027,6 +7027,18 @@ done:
 			janus_mutex_lock(&mp->mutex);
 			janus_mutex_lock(&session->mutex);
 			janus_refcount_increase(&mp->ref);
+            
+            /* We were paused: reset the sequence number in RTP packets */
+            if(session->streams != NULL) {
+                GList *temp = session->streams;
+                while(temp) {
+                    janus_streaming_session_stream *s = (janus_streaming_session_stream *)temp->data;
+                    if(s != NULL)
+                        s->context.seq_reset = TRUE;
+                    temp = temp->next;
+                }
+            }            
+            
 			mp->viewers = g_list_append(mp->viewers, session);
 			/* If we're using helper threads, add the viewer to one of those */
 			if(mp->helper_threads > 0) {

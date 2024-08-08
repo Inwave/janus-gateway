@@ -573,6 +573,7 @@ var Janus = (function (factory) {
 		gatewayCallbacks.success = (typeof gatewayCallbacks.success == "function") ? gatewayCallbacks.success : Janus.noop;
 		gatewayCallbacks.error = (typeof gatewayCallbacks.error == "function") ? gatewayCallbacks.error : Janus.noop;
 		gatewayCallbacks.destroyed = (typeof gatewayCallbacks.destroyed == "function") ? gatewayCallbacks.destroyed : Janus.noop;
+        gatewayCallbacks.handleMQTTMessage= (typeof gatewayCallbacks.handleMQTTMessage == "function") ? gatewayCallbacks.handleMQTTMessage : Janus.noop;
 		if(!Janus.initDone) {
 			gatewayCallbacks.error("Library not initialized");
 			return {};
@@ -587,12 +588,20 @@ var Janus = (function (factory) {
 			return {};
 		}
 		let websockets = false;
+        let wsmqtt = false;
 		let ws = null;
+        let mqtt = null;
 		let wsHandlers = {};
 		let wsKeepaliveTimeoutId = null;
+		let mqttKeepaliveTimeoutId = null;
+		let mqttTimeoutId = null;        
 		let servers = null;
 		let serversIndex = 0;
 		let server = gatewayCallbacks.server;
+        let mqtt_topic = gatewayCallbacks.mqtt_topic;
+        let mqtt_username = gatewayCallbacks.mqtt_username;
+        let mqtt_password = gatewayCallbacks.mqtt_password;
+        let mqtt_client_id = gatewayCallbacks.mqtt_client_id || "client-" + Janus.randomString(12) + "-" + (new Date().getUTCMilliseconds());;        
 		if(Janus.isArray(server)) {
 			Janus.log("Multiple servers provided (" + server.length + "), will use the first that works");
 			server = null;
@@ -603,8 +612,12 @@ var Janus = (function (factory) {
 				websockets = true;
 				Janus.log("Using WebSockets to contact Janus: " + server);
 			} else {
-				websockets = false;
-				Janus.log("Using REST API to contact Janus: " + server);
+                if(server.indexOf("mqtt") === 0) {
+                    wsmqtt = true;
+                    Janus.log("Using MQTT to contact Janus: " + server);
+                }else{
+                    Janus.log("Using REST API to contact Janus: " + server);
+                }
 			}
 		}
 		let iceServers = gatewayCallbacks.iceServers || [{urls: "stun:stun.l.google.com:19302"}];
@@ -643,6 +656,12 @@ var Janus = (function (factory) {
 			longPollTimeout = gatewayCallbacks.longPollTimeout;
 		if(isNaN(longPollTimeout))
 			longPollTimeout = 60000;
+        // Some timeout values
+        let requestResponseTimeout = 5000;
+        if(gatewayCallbacks.requestResponseTimeout !== undefined && gatewayCallbacks.requestResponseTimeout !== null)
+            requestResponseTimeout = gatewayCallbacks.requestResponseTimeout;
+        if(isNaN(requestResponseTimeout))
+            requestResponseTimeout = 5000;        
 
 		// overrides for default maxBitrate values for simulcasting
 		function getMaxBitrates(simulcastMaxBitrates) {
@@ -674,6 +693,7 @@ var Janus = (function (factory) {
 
 		// Public methods
 		this.getServer = function() { return server; };
+        this.getMQTT = function() { return mqtt; };
 		this.isConnected = function() { return connected; };
 		this.reconnect = function(callbacks) {
 			callbacks = callbacks || {};
@@ -724,9 +744,18 @@ var Janus = (function (factory) {
 		// Private event handler: this will trigger plugin callbacks, if set
 		function handleEvent(json, skipTimeout) {
 			retries = 0;
-			if(!websockets && typeof sessionId !== 'undefined' && sessionId !== null && skipTimeout !== true)
+            
+            if(sessionId !== undefined && sessionId !== null) {
+                if(json["session_id"] !== undefined) {
+                    if(json["session_id"] != sessionId) {
+                        return;
+                    }
+                }
+            }            
+            
+			if(!websockets && !wsmqtt && typeof sessionId !== 'undefined' && sessionId !== null && skipTimeout !== true)
 				eventHandler();
-			if(!websockets && Janus.isArray(json)) {
+			if(!websockets && !wsmqtt && Janus.isArray(json)) {
 				// We got an array: it means we passed a maxev > 1, iterate on all objects
 				for(let i=0; i<json.length; i++) {
 					handleEvent(json[i], true);
@@ -947,10 +976,10 @@ var Janus = (function (factory) {
 		}
 
 		// Private helper to send keep-alive messages on WebSockets
-		function keepAlive() {
+		function keepAliveWS() {
 			if(!server || !websockets || !connected)
 				return;
-			wsKeepaliveTimeoutId = setTimeout(keepAlive, keepAlivePeriod);
+			wsKeepaliveTimeoutId = setTimeout(keepAliveWS, keepAlivePeriod);
 			let request = { "janus": "keepalive", "session_id": sessionId, "transaction": Janus.randomString(12) };
 			if(token)
 				request["token"] = token;
@@ -958,6 +987,39 @@ var Janus = (function (factory) {
 				request["apisecret"] = apisecret;
 			ws.send(JSON.stringify(request));
 		}
+        
+        function keepAliveMQTT() {
+            if(!server || !wsmqtt || !connected)
+                return;
+            mqttKeepaliveTimeoutId = setTimeout(keepAliveMQTT, keepAlivePeriod);
+            let request = { "janus": "keepalive", "session_id": sessionId, "transaction": Janus.randomString(12) };
+            if(token)
+                request["token"] = token;
+            if(apisecret)
+                request["apisecret"] = apisecret;
+            
+            let message = new Paho.Message(JSON.stringify(request));
+            message.destinationName = mqtt_topic + "/janus/to";
+            message.qos = 0;
+            
+            /*if(mqttTimeoutId != null) {
+                clearTimeout(mqttTimeoutId);
+                mqttTimeoutId = null;
+            }
+            mqttTimeoutId = setTimeout(requestResponseTimeoutMQTT, requestResponseTimeout);	*/				
+            mqtt.send(message);	
+        }   
+
+        function requestResponseTimeoutMQTT() {
+            if(!server || !wsmqtt)
+                return;
+            
+            gatewayCallbacks.error("Lost connection to the device or feature is unsupported (is it down?)");
+
+            if (wsmqtt) {
+                mqtt.disconnect();
+            }
+        }        
 
 		// Private method to create a session
 		function createSession(callbacks) {
@@ -978,6 +1040,14 @@ var Janus = (function (factory) {
 						wsKeepaliveTimeoutId = null;
 					}
 				}
+                if(wsmqtt) {
+                    mqtt.onConnectionLost  = function() {};
+                    
+                    if(mqttKeepaliveTimeoutId) {
+                        clearTimeout(mqttKeepaliveTimeoutId);
+                        mqttKeepaliveTimeoutId = null;
+                    }
+                }                
 			}
 			if(token)
 				request["token"] = token;
@@ -1025,7 +1095,7 @@ var Janus = (function (factory) {
 								callbacks.error(json["error"].reason);
 								return;
 							}
-							wsKeepaliveTimeoutId = setTimeout(keepAlive, keepAlivePeriod);
+							wsKeepaliveTimeoutId = setTimeout(keepAliveWS, keepAlivePeriod);
 							connected = true;
 							sessionId = json["session_id"] ? json["session_id"] : json.data["id"];
 							if(callbacks["reconnect"]) {
@@ -1059,6 +1129,110 @@ var Janus = (function (factory) {
 
 				return;
 			}
+            if(wsmqtt) {
+                let s = server.split('://');
+                
+                let [host,port] = s[1].split(':')
+                
+                mqtt = new Paho.Client(host, parseInt(port),mqtt_client_id);
+                
+                let options = {
+                    onSuccess : function onMQTTConnect() {
+                        Janus.log("MQTT Connected");
+                        
+                        mqtt.subscribe(mqtt_topic + "/janus/from", {
+                            qos : 0
+                        });
+                        
+                        // We need to be notified about the success
+                        transactions.set(transaction, function(json) {
+                            Janus.debug(json);
+                            if (json["janus"] !== "success") {
+                                Janus.error("Ooops: " + json["error"].code + " " + json["error"].reason);	// FIXME
+                                callbacks.error(json["error"].reason);
+                                return;
+                            }
+                            mqttKeepaliveTimeoutId = setTimeout(keepAliveMQTT, keepAlivePeriod);
+                            connected = true;
+                            sessionId = json["session_id"] ? json["session_id"] : json.data["id"];
+                            if(callbacks["reconnect"]) {
+                                Janus.log("Claimed session: " + sessionId);
+                            } else {
+                                Janus.log("Created session: " + sessionId);
+                            }
+                            Janus.sessions.set(sessionId, that);
+                            callbacks.success();
+                        });
+                        
+                        let message = new Paho.Message(JSON.stringify(request));
+                        message.destinationName = mqtt_topic + "/janus/to";
+                        message.qos = 0;
+                        
+                        if(mqttTimeoutId != null) {
+                            clearTimeout(mqttTimeoutId);
+                            mqttTimeoutId = null;
+                        }
+                        mqttTimeoutId = setTimeout(requestResponseTimeoutMQTT, requestResponseTimeout);					
+                        mqtt.send(message);
+
+                    },
+                    onFailure : function onMQTTFailure() {
+                        Janus.error("Error connecting to the Janus WebSockets server... " + server);
+                        if (Janus.isArray(servers) && !callbacks["reconnect"]) {
+                            serversIndex++;
+                            if (serversIndex === servers.length) {
+                                // We tried all the servers the user gave us and they all failed
+                                callbacks.error("Error connecting to any of the provided Janus servers: Is the server down or feature is unsupported?");
+                                return;
+                            }
+                            // Let's try the next server
+                            server = null;
+                            setTimeout(function() {
+                                createSession(callbacks);
+                            }, 200);
+                            return;
+                        }
+                        callbacks.error("Error connecting to the Janus WebSockets server: Is the server down or feature is unsupported?");
+                    },
+                    useSSL: s[0] == 'mqtts' ? true : false,
+                    "userName" : mqtt_username,
+                    "password" : mqtt_password,
+                    cleanSession : true,
+                    reconnect : false
+                };
+                mqtt.onMessageArrived = function onMQTTMessageArrived(msg) {
+                    if(mqttTimeoutId != null) {
+                        clearTimeout(mqttTimeoutId);
+                        mqttTimeoutId = null;
+                    }
+                    
+                    if(gatewayCallbacks.handleMQTTMessage && gatewayCallbacks.handleMQTTMessage !== Janus.noop) {
+                        if(gatewayCallbacks.handleMQTTMessage(msg) === false) {
+                            Janus.debug(msg.payloadString);
+                            return;
+                        }
+                    }
+
+
+                    handleEvent(JSON.parse(msg.payloadString));
+                };
+                
+                mqtt.onConnectionLost = function (responseObject) {
+                    if (!server || !connected) {
+                        return;
+                    }
+                    console.log("DISCONNNNNECTED");
+                    connected = false;
+                    // FIXME What if this is called when the page is closed?
+                    gatewayCallbacks.error("Lost connection to the device (is it down?)");
+                };
+                
+                if (!mqtt.isConnected()) {
+                    mqtt.connect(options);
+                }
+                
+                return;
+            }            
 			Janus.httpAPICall(server, {
 				verb: 'POST',
 				withCredentials: withCredentials,
@@ -1136,6 +1310,28 @@ var Janus = (function (factory) {
 				ws.send(JSON.stringify(request));
 				return;
 			}
+            if(wsmqtt) {
+                transactions.set(transaction, function(json) {
+                    Janus.log("Server info:");
+                    Janus.debug(json);
+                    if(json["janus"] !== "server_info") {
+                        Janus.error("Ooops: " + json["error"].code + " " + json["error"].reason);	// FIXME
+                    }
+                    callbacks.success(json);
+                });
+                
+                let message = new Paho.Message(JSON.stringify(request));
+                message.destinationName = mqtt_topic + "/janus/to";
+                message.qos = 0;
+                
+                if(mqttTimeoutId != null) {
+                    clearTimeout(mqttTimeoutId);
+                    mqttTimeoutId = null;
+                }
+                mqttTimeoutId = setTimeout(requestResponseTimeoutMQTT, requestResponseTimeout);					
+                mqtt.send(message);
+                return;
+            }            
 			Janus.httpAPICall(server, {
 				verb: 'POST',
 				withCredentials: withCredentials,
@@ -1170,6 +1366,21 @@ var Janus = (function (factory) {
 				notifyDestroyed = (callbacks.notifyDestroyed === true);
 			let cleanupHandles = (callbacks.cleanupHandles === true);
 			Janus.log("Destroying session " + sessionId + " (unload=" + unload + ")");
+            
+            // Necessary if in connecting state
+            if(mqttKeepaliveTimeoutId) {
+                clearTimeout(mqttKeepaliveTimeoutId);
+                mqttKeepaliveTimeoutId = null;
+            }
+            if(mqttTimeoutId != null) {
+                clearTimeout(mqttTimeoutId);
+                mqttTimeoutId = null;
+            }	
+            if(wsKeepaliveTimeoutId) {
+                clearTimeout(wsKeepaliveTimeoutId);
+                wsKeepaliveTimeoutId = null;
+            }            
+            
 			if(!sessionId) {
 				Janus.warn("No session to destroy");
 				callbacks.success();
@@ -1200,7 +1411,11 @@ var Janus = (function (factory) {
 					ws.onclose = null;
 					ws.close();
 					ws = null;
-				} else {
+                }else if(wsmqtt) {
+                    mqtt.onConnectionLost   = function() {};
+                    mqtt.disconnect();
+                    mqtt = null;
+                } else {
 					navigator.sendBeacon(server + "/" + sessionId, JSON.stringify(request));
 				}
 				Janus.log("Destroyed session:");
@@ -1253,6 +1468,63 @@ var Janus = (function (factory) {
 
 				return;
 			}
+            if(wsmqtt) {
+                request["session_id"] = sessionId;
+
+                let unbindMQTT = function() {
+                    mqtt.onConnectionLost = function() {};;
+                    mqtt.onMessageArrived = function() {};
+                    //ws.removeEventListener('error', onUnbidMQTTError);
+                    if(mqttKeepaliveTimeoutId) {
+                        clearTimeout(mqttKeepaliveTimeoutId);
+                        mqttKeepaliveTimeoutId = null;
+                    }
+                    if(mqttTimeoutId != null) {
+                        clearTimeout(mqttTimeoutId);
+                        mqttTimeoutId = null;
+                    }				
+                    
+                    mqtt.unsubscribe(mqtt_topic + "/janus/from");
+                    mqtt.disconnect();
+                };
+                
+                let onUnbindMQTTMessage = function(msg){
+                    let data = JSON.parse(msg.payloadString);
+                    if(data.session_id == request.session_id && data.transaction == request.transaction) {
+                        unbindMQTT();
+                        callbacks.success();
+                        if(notifyDestroyed)
+                            gatewayCallbacks.destroyed();
+                    }
+                };
+                let onUnbindMQTTError = function(event) {
+                    unbindMQTT();
+                    callbacks.error("Failed to destroy the server: Is the server down?");
+                    if(notifyDestroyed)
+                        gatewayCallbacks.destroyed();
+                };
+
+
+                mqtt.onMessageArrived = onUnbindMQTTMessage;
+                //ws.addEventListener('error', onUnbindMQTTError);			
+
+                if (mqtt.isConnected()) {
+                    let message = new Paho.Message(JSON.stringify(request));
+                    message.destinationName = mqtt_topic + "/janus/to";
+                    message.qos = 0;
+                    
+                    if(mqttTimeoutId != null) {
+                        clearTimeout(mqttTimeoutId);
+                        mqttTimeoutId = null;
+                    }
+                    //mqttTimeoutId = setTimeout(requestResponseTimeoutMQTT, requestResponseTimeout);*/						
+                    mqtt.send(message);				
+                } else {
+                    onUnbindMQTTError();
+                }
+                
+                return;
+            }            
 			Janus.httpAPICall(server + "/" + sessionId, {
 				verb: 'POST',
 				withCredentials: withCredentials,
@@ -1396,6 +1668,92 @@ var Janus = (function (factory) {
 				ws.send(JSON.stringify(request));
 				return;
 			}
+            if(wsmqtt) {
+                transactions.set(transaction, function(json) {
+                    Janus.debug(json);
+                    if(json["janus"] !== "success") {
+                        Janus.error("Ooops: " + json["error"].code + " " + json["error"].reason);	// FIXME
+                        callbacks.error("Ooops: " + json["error"].code + " " + json["error"].reason);
+                        return;
+                    }
+                    let handleId = json.data["id"];
+                    Janus.log("Created handle: " + handleId);
+                    let pluginHandle =
+                        {
+                            session : that,
+                            plugin : plugin,
+                            id : handleId,
+                            token : handleToken,
+                            detached : false,
+                            webrtcStuff : {
+                                started : false,
+                                myStream : null,
+                                streamExternal : false,
+                                mySdp : null,
+                                mediaConstraints : null,
+                                pc : null,
+                                dataChannelOptions: callbacks.dataChannelOptions,
+                                dataChannel : {},
+                                dtmfSender : null,
+                                trickle : true,
+                                iceDone : false,
+                                bitrate : {}
+                            },
+                            getId : function() { return handleId; },
+                            getPlugin : function() { return plugin; },
+                            getVolume : function(mid, result) { return getVolume(handleId, mid, true, result); },
+                            getRemoteVolume : function(mid, result) { return getVolume(handleId, mid, true, result); },
+                            getLocalVolume : function(mid, result) { return getVolume(handleId, mid, false, result); },
+                            isAudioMuted : function(mid) { return isMuted(handleId, mid, false); },
+                            muteAudio : function(mid) { return mute(handleId, mid, false, true); },
+                            unmuteAudio : function(mid) { return mute(handleId, mid, false, false); },
+                            isVideoMuted : function(mid) { return isMuted(handleId, mid, true); },
+                            muteVideo : function(mid) { return mute(handleId, mid, true, true); },
+                            unmuteVideo : function(mid) { return mute(handleId, mid, true, false); },
+                            getBitrate : function(mid) { return getBitrate(handleId, mid); },
+                            setMaxBitrate : function(mid, bitrate) { return setBitrate(handleId, mid, bitrate); },
+                            send : function(callbacks) { sendMessage(handleId, callbacks); },
+                            data : function(callbacks) { sendData(handleId, callbacks); },
+                            dtmf : function(callbacks) { sendDtmf(handleId, callbacks); },
+                            consentDialog : callbacks.consentDialog,
+                            connectionState : callbacks.connectionState,
+                            iceState : callbacks.iceState,
+                            mediaState : callbacks.mediaState,
+                            webrtcState : callbacks.webrtcState,
+                            slowLink : callbacks.slowLink,
+                            onmessage : callbacks.onmessage,
+                            createOffer : function(callbacks) { prepareWebrtc(handleId, true, callbacks); },
+                            createAnswer : function(callbacks) { prepareWebrtc(handleId, false, callbacks); },
+                            handleRemoteJsep : function(callbacks) { prepareWebrtcPeer(handleId, callbacks); },
+                            replaceTracks : function(callbacks) { replaceTracks(handleId, callbacks); },
+                            getLocalTracks : function() { return getLocalTracks(handleId); },
+                            getRemoteTracks : function() { return getRemoteTracks(handleId); },
+                            onlocaltrack : callbacks.onlocaltrack,
+                            onremotetrack : callbacks.onremotetrack,
+                            ondata : callbacks.ondata,
+                            ondataopen : callbacks.ondataopen,
+                            oncleanup : callbacks.oncleanup,
+                            ondetached : callbacks.ondetached,
+                            hangup : function(sendRequest) { cleanupWebrtc(handleId, sendRequest === true); },
+                            detach : function(callbacks) { destroyHandle(handleId, callbacks); }
+                        };
+                    pluginHandles.set(handleId,pluginHandle);
+                    callbacks.success(pluginHandle);
+                });
+                request["session_id"] = sessionId;
+                
+                let message = new Paho.Message(JSON.stringify(request));
+                message.destinationName = mqtt_topic + "/janus/to";
+                message.qos = 0;
+                
+                if(mqttTimeoutId != null) {
+                    clearTimeout(mqttTimeoutId);
+                    mqttTimeoutId = null;
+                }
+                mqttTimeoutId = setTimeout(requestResponseTimeoutMQTT, requestResponseTimeout);					
+                mqtt.send(message);			
+                return;
+            }            
 			Janus.httpAPICall(server + "/" + sessionId, {
 				verb: 'POST',
 				withCredentials: withCredentials,
@@ -1582,6 +1940,52 @@ var Janus = (function (factory) {
 				ws.send(JSON.stringify(request));
 				return;
 			}
+            if(wsmqtt) {
+                request["session_id"] = sessionId;
+                request["handle_id"] = handleId;
+                transactions.set(transaction, function(json) {
+                    Janus.debug("Message sent!");
+                    Janus.debug(json);
+                    if(json["janus"] === "success") {
+                        // We got a success, must have been a synchronous transaction
+                        let plugindata = json["plugindata"];
+                        if(!plugindata) {
+                            Janus.warn("Request succeeded, but missing plugindata...");
+                            callbacks.success();
+                            return;
+                        }
+                        Janus.log("Synchronous transaction successful (" + plugindata["plugin"] + ")");
+                        let data = plugindata["data"];
+                        Janus.debug(data);
+                        callbacks.success(data);
+                        return;
+                    } else if(json["janus"] !== "ack") {
+                        // Not a success and not an ack, must be an error
+                        if(json["error"]) {
+                            Janus.error("Ooops: " + json["error"].code + " " + json["error"].reason);	// FIXME
+                            callbacks.error(json["error"].code + " " + json["error"].reason);
+                        } else {
+                            Janus.error("Unknown error");	// FIXME
+                            callbacks.error("Unknown error");
+                        }
+                        return;
+                    }
+                    // If we got here, the plugin decided to handle the request asynchronously
+                    callbacks.success();
+                });			
+                
+                let message = new Paho.Message(JSON.stringify(request));
+                message.destinationName = mqtt_topic + "/janus/to";
+                message.qos = 0;
+                
+                if(mqttTimeoutId != null) {
+                    clearTimeout(mqttTimeoutId);
+                    mqttTimeoutId = null;
+                }
+                mqttTimeoutId = setTimeout(requestResponseTimeoutMQTT, requestResponseTimeout);					
+                mqtt.send(message);			
+                return;
+            }            
 			Janus.httpAPICall(server + "/" + sessionId + "/" + handleId, {
 				verb: 'POST',
 				withCredentials: withCredentials,
@@ -1647,6 +2051,22 @@ var Janus = (function (factory) {
 				ws.send(JSON.stringify(request));
 				return;
 			}
+            if(wsmqtt) {
+                request["session_id"] = sessionId;
+                request["handle_id"] = handleId;
+                
+                let message = new Paho.Message(JSON.stringify(request));
+                message.destinationName = mqtt_topic + "/janus/to";
+                message.qos = 0;
+                
+                if(mqttTimeoutId != null) {
+                    clearTimeout(mqttTimeoutId);
+                    mqttTimeoutId = null;
+                }
+                mqttTimeoutId = setTimeout(requestResponseTimeoutMQTT, requestResponseTimeout);					
+                mqtt.send(message);		
+                return;
+            }            
 			Janus.httpAPICall(server + "/" + sessionId + "/" + handleId, {
 				verb: 'POST',
 				withCredentials: withCredentials,
@@ -1857,6 +2277,25 @@ var Janus = (function (factory) {
 				callbacks.success();
 				return;
 			}
+            if(wsmqtt) {
+                request["session_id"] = sessionId;
+                request["handle_id"] = handleId;
+                
+                let message = new Paho.Message(JSON.stringify(request));
+                message.destinationName = mqtt_topic + "/janus/to";
+                message.qos = 0;
+                
+                if(mqttTimeoutId != null) {
+                    clearTimeout(mqttTimeoutId);
+                    mqttTimeoutId = null;
+                }
+                mqttTimeoutId = setTimeout(requestResponseTimeoutMQTT, requestResponseTimeout);					
+                mqtt.send(message);	
+                
+                pluginHandles.delete(handleId);
+                callbacks.success();
+                return;
+            }            
 			Janus.httpAPICall(server + "/" + sessionId + "/" + handleId, {
 				verb: 'POST',
 				withCredentials: withCredentials,
@@ -3172,11 +3611,28 @@ var Janus = (function (factory) {
 						request["handle_id"] = handleId;
 						ws.send(JSON.stringify(request));
 					} else {
-						Janus.httpAPICall(server + "/" + sessionId + "/" + handleId, {
-							verb: 'POST',
-							withCredentials: withCredentials,
-							body: request
-						});
+                        if(wsmqtt) {
+                            request["session_id"] = sessionId;
+                            request["handle_id"] = handleId;
+                            
+                            let message = new Paho.Message(JSON.stringify(request));
+                            message.destinationName = mqtt_topic + "/janus/to";
+                            message.qos = 0;
+                            
+                            
+                            if(mqttTimeoutId != null) {
+                                clearTimeout(mqttTimeoutId);
+                                mqttTimeoutId = null;
+                            }
+                            mqttTimeoutId = setTimeout(requestResponseTimeoutMQTT, requestResponseTimeout);					
+                            mqtt.send(message);							
+                        }else{
+                            Janus.httpAPICall(server + "/" + sessionId + "/" + handleId, {
+                                verb: 'POST',
+                                withCredentials: withCredentials,
+                                body: request
+                            });
+                        }                        
 					}
 				}
 				// Cleanup stack
