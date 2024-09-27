@@ -9338,23 +9338,6 @@ static void *janus_streaming_relay_thread(void *data) {
 		return NULL;
 	}
 
-	/* Check how many file descriptors we'll need to monitor */
-	int num = 0;
-	janus_streaming_rtp_source_stream *stream = NULL;
-	GList *temp = source->media;
-	while(temp) {
-		janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
-		if(stream->fd[0] != -1)
-			num++;
-		if(stream->fd[1] != -1)
-			num++;
-		if(stream->fd[2] != -1)
-			num++;
-		if(stream->rtcp_fd != -1)
-			num++;
-		temp = temp->next;
-	}
-	num++;	/* There's the pipe too */
 
 	/* Add a reference to the helper threads, if needed */
 	if(mountpoint->helper_threads > 0) {
@@ -9373,7 +9356,6 @@ static void *janus_streaming_relay_thread(void *data) {
 	socklen_t addrlen;
 	struct sockaddr_storage remote;
 	int resfd = 0, bytes = 0;
-	struct pollfd *fds = g_malloc(num * sizeof(struct pollfd));
 	char buffer[1500];
 	memset(buffer, 0, 1500);
 	/* We'll have a dynamic number of streams */
@@ -9387,7 +9369,31 @@ static void *janus_streaming_relay_thread(void *data) {
 	gboolean connected = TRUE;
 #endif
 	/* Loop */
+    GList *temp;
 	janus_streaming_rtp_relay_packet packet;
+    struct pollfd *fds = NULL;
+    
+    /* Check how many file descriptors we'll need to monitor */
+    int current_num_fds = 0;
+    janus_streaming_rtp_source_stream *stream = NULL;
+    temp = source->media;
+    while(temp) {
+        janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
+        if(stream->fd[0] != -1)
+            current_num_fds++;
+        if(stream->fd[1] != -1)
+            current_num_fds++;
+        if(stream->fd[2] != -1)
+            current_num_fds++;
+        if(stream->rtcp_fd != -1)
+            current_num_fds++;
+        temp = temp->next;
+    }
+    current_num_fds++;	/* There's the pipe too */
+
+    fds = g_malloc(current_num_fds * sizeof(struct pollfd));    
+    
+    
 	while(!g_atomic_int_get(&stopping) && !g_atomic_int_get(&mountpoint->destroyed)) {
 #ifdef HAVE_LIBCURL
 		/* Let's check regularly if the RTSP server seems to be gone */
@@ -9490,6 +9496,31 @@ static void *janus_streaming_relay_thread(void *data) {
 			}
 		}
 #endif
+        /* Check how many file descriptors we'll need to monitor */
+        int num = 0;        
+        {
+            janus_streaming_rtp_source_stream *stream = NULL;
+            temp = source->media;
+            while(temp) {
+                janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
+                if(stream->fd[0] != -1)
+                    num++;
+                if(stream->fd[1] != -1)
+                    num++;
+                if(stream->fd[2] != -1)
+                    num++;
+                if(stream->rtcp_fd != -1)
+                    num++;
+                temp = temp->next;
+            }
+            num++;	/* There's the pipe too */
+        }
+
+        if(num > current_num_fds) {
+            fds = g_realloc(fds, num * sizeof(struct pollfd));
+            current_num_fds = num;
+        }
+
 		/* Prepare poll */
 		num = 0;
 		temp = source->media;
@@ -10032,7 +10063,8 @@ static void *janus_streaming_relay_thread(void *data) {
 		stream->rtcp_fd = -1;
 		temp = temp->next;
 	}
-	g_free(fds);
+    if(fds != NULL)
+        g_free(fds);
 
 	/* Notify users this mountpoint is done */
 	janus_mutex_lock(&mountpoint->mutex);
