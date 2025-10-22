@@ -8529,9 +8529,9 @@ static size_t janus_streaming_rtsp_interleave_cb(char *ptr, size_t size, size_t 
 				/* Got something audio (RTP) */
 				if(mountpoint->active == FALSE)
 					mountpoint->active = TRUE;
-	#ifdef HAVE_LIBCURL
+#ifdef HAVE_LIBCURL
 				source->reconnect_timer = now;
-	#endif
+#endif
 
 				janus_streaming_handle_rtp_packet_audio(name, mountpoint, source, stream, (char*)payload, (int)plen, now, index) ;
 			} else if(stream->type == JANUS_STREAMING_MEDIA_VIDEO) {
@@ -8552,7 +8552,7 @@ static size_t janus_streaming_rtsp_interleave_cb(char *ptr, size_t size, size_t 
 				source->reconnect_timer = janus_get_monotonic_time();
 	#endif
 				janus_streaming_handle_rtp_packet_data(name, mountpoint, source, stream, (char*)payload, (int)plen, now, index);
-			}			
+			}
 		} else if(is_rtcp) {
 			janus_streaming_handle_rtp_packet_others(name, mountpoint, source, stream, (char*)payload, (int)plen, now, 0);
 		}
@@ -8725,6 +8725,9 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, source->rtsp_conn_timeout);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 0L);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	if(source->rtsp_tcp) {
+		curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L); // Force
+	}
 #if CURL_AT_LEAST_VERSION(7, 66, 0)
 #if CURL_AT_LEAST_VERSION(7, 85, 0)
 	curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "rtsp");
@@ -9514,6 +9517,12 @@ static int janus_streaming_rtsp_play(janus_streaming_rtp_source *source, janus_s
 		return -1;
 	}
 	JANUS_LOG(LOG_VERB, "PLAY answer:%s\n", source->curldata->buffer);
+
+	if (source->rtsp_tcp) {
+		curl_easy_setopt(source->curl, CURLOPT_TIMEOUT_MS, 200L);
+		curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_RECEIVE);
+	}
+
 	source->played = TRUE;
 	janus_mutex_unlock(&source->rtsp_mutex);	
 	return 0;
@@ -10243,23 +10252,6 @@ static void *janus_streaming_relay_thread(void *data) {
 							name, curl_easy_strerror(resfd), source->curl_errbuf);
 					}
 					janus_mutex_unlock(&source->rtsp_mutex);
-				}else{
-					JANUS_LOG(LOG_VERB, "[%s] %"SCNi64"s passed, sending GET_PARAMETERS\n", name, (now-before)/G_USEC_PER_SEC);
-					before = now;
-					/* Send an RTSP OPTIONS */
-					janus_mutex_lock(&source->rtsp_mutex);
-					g_free(source->curldata->buffer);
-					source->curldata->buffer = g_malloc0(1);
-					source->curldata->size = 0;
-					curl_easy_setopt(source->curl, CURLOPT_TIMEOUT_MS, source->rtsp_timeout*1000L);
-					curl_easy_setopt(source->curl, CURLOPT_RTSP_STREAM_URI, source->rtsp_url);
-					        curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_GET_PARAMETER);
-					resfd = curl_easy_perform(source->curl);
-					if (resfd != CURLE_OK) {
-						JANUS_LOG(LOG_WARN, "[%s] RTSP keepalive failed: %s\n",
-								mountpoint->name, curl_easy_strerror(resfd));					
-					} 
-					janus_mutex_unlock(&source->rtsp_mutex);
 				}
 			}
 		}
@@ -10268,8 +10260,6 @@ static void *janus_streaming_relay_thread(void *data) {
 
 		if(source->rtsp_tcp) {
 			if(!source->reconnecting && connected && source->played) {
-				curl_easy_setopt(source->curl, CURLOPT_TIMEOUT_MS, 200L);
-				curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_RECEIVE);
 				CURLcode rc = curl_easy_perform(source->curl);
 
 				if (rc == CURLE_OK || rc == CURLE_OPERATION_TIMEDOUT) { 
