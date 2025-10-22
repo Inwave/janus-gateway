@@ -10048,12 +10048,35 @@ static void *janus_streaming_filesource_thread(void *data) {
 	return NULL;
 }
 
-static void janus_streaming_rtsp_close_tcp(janus_streaming_rtp_source *source, const char *who) {
-#ifdef HAVE_LIBCURL
-    if(!(source && source->rtsp && source->rtsp_tcp))
+static inline void streaming_close_fd(GHashTable *ht, int *pfd) {
+    if(*pfd > -1) {
+        if(ht) g_hash_table_remove(ht, GINT_TO_POINTER(*pfd));
+        close(*pfd);
+        *pfd = -1;
+    }
+}
+
+static void janus_streaming_rtsp_close(janus_streaming_rtp_source *source, const char *who, gboolean send_teardown) {
+    if(!source) {
         return;
+	}
+	GList *temp;
+
+	if(!source->rtsp_tcp) {
+		temp = source->media;
+		while(temp) {
+			janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
+			streaming_close_fd(source->media_byfd, &stream->fd[0]);
+			streaming_close_fd(source->media_byfd, &stream->fd[1]);
+			streaming_close_fd(source->media_byfd, &stream->fd[2]);
+			streaming_close_fd(source->media_byfd, &stream->rtcp_fd);
+			temp = temp->next;
+		}
+	}
+
+#ifdef HAVE_LIBCURL
     janus_mutex_lock(&source->rtsp_mutex);
-    if (source->curl && source->rtsp_url && source->curldata) {
+    if (send_teardown && source->curl && source->rtsp_url && source->curldata) {
         g_free(source->curldata->buffer);
         source->curldata->buffer = g_malloc0(1);
         source->curldata->size = 0;
@@ -10067,14 +10090,14 @@ static void janus_streaming_rtsp_close_tcp(janus_streaming_rtp_source *source, c
             JANUS_LOG(LOG_VERB, "[%s] RTSP TEARDOWN sent\n", who);
         }
     }
+	janus_mutex_unlock(&source->rtsp_mutex);	
     if (source->curl) { curl_easy_cleanup(source->curl); source->curl = NULL; }
     if (source->curl_errbuf) { g_free(source->curl_errbuf); source->curl_errbuf = NULL; }
     if (source->curldata) { g_free(source->curldata->buffer); g_free(source->curldata); source->curldata = NULL; }
+#endif
     source->reconnecting = FALSE;
     source->reconnect_timer = 0;
     source->remb_latest = 0;
-    janus_mutex_unlock(&source->rtsp_mutex);
-#endif
 }
 
 /* Thread to relay RTP frames coming from gstreamer/ffmpeg/others */
@@ -10164,45 +10187,12 @@ static void *janus_streaming_relay_thread(void *data) {
 				/*  Assume the RTSP server has gone and schedule a reconnect */
 				JANUS_LOG(LOG_WARN, "[%s] %"SCNi64"s passed with no media, trying to reconnect the RTSP stream\n",
 					name, (now - source->reconnect_timer)/G_USEC_PER_SEC);
-				temp = source->media;
-				while(temp) {
-					janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
-					if(stream->fd[0] > -1) {
-						g_hash_table_remove(source->media_byfd, GINT_TO_POINTER(stream->fd[0]));
-						close(stream->fd[0]);
-					}
-					stream->fd[0] = -1;
-					if(stream->fd[1] > -1) {
-						g_hash_table_remove(source->media_byfd, GINT_TO_POINTER(stream->fd[1]));
-						close(stream->fd[1]);
-					}
-					stream->fd[1] = -1;
-					if(stream->fd[2] > -1) {
-						g_hash_table_remove(source->media_byfd, GINT_TO_POINTER(stream->fd[2]));
-						close(stream->fd[2]);
-					}
-					stream->fd[2] = -1;
-					if(stream->rtcp_fd > -1) {
-						g_hash_table_remove(source->media_byfd, GINT_TO_POINTER(stream->rtcp_fd));
-						close(stream->rtcp_fd);
-					}
-					stream->rtcp_fd = -1;
-					temp = temp->next;
-				}
-				janus_streaming_rtsp_close_tcp(source, name); // Fecha se é TCP
+
+				janus_streaming_rtsp_close(source, name, TRUE); 
 				source->reconnect_timer = now;
 				connected = FALSE;
 				source->reconnecting = TRUE;
 				source->played = FALSE;
-				/* Let's clean up the source first */
-				curl_easy_cleanup(source->curl);
-				source->curl = NULL;
-				g_free(source->curl_errbuf);
-				source->curl_errbuf = NULL;
-				if(source->curldata)
-					g_free(source->curldata->buffer);
-				g_free(source->curldata);
-				source->curldata = NULL;
 				if(g_atomic_int_get(&mountpoint->destroyed))
 					break;
 				/* Now let's try to reconnect */
@@ -10555,25 +10545,8 @@ static void *janus_streaming_relay_thread(void *data) {
 	}
 
 
-	janus_streaming_rtsp_close_tcp(source, name);
-	/* Close the ports we bound to */
-	temp = source->media;
-	while(temp) {
-		janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
-		if(stream->fd[0] > -1)
-			close(stream->fd[0]);
-		stream->fd[0] = -1;
-		if(stream->fd[1] > -1)
-			close(stream->fd[1]);
-		stream->fd[1] = -1;
-		if(stream->fd[2] > -1)
-			close(stream->fd[2]);
-		stream->fd[2] = -1;
-		if(stream->rtcp_fd > -1)
-			close(stream->rtcp_fd);
-		stream->rtcp_fd = -1;
-		temp = temp->next;
-	}
+	janus_streaming_rtsp_close(source, name, FALSE);
+
     if(fds != NULL)
         g_free(fds);
 
