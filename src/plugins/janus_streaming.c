@@ -1225,6 +1225,7 @@ static janus_mutex config_mutex = JANUS_MUTEX_INITIALIZER;
 static volatile gint initialized = 0, stopping = 0;
 static gboolean notify_events = TRUE;
 static gboolean string_ids = FALSE;
+static gboolean global_rtsp_tcp = FALSE;
 static janus_callbacks *gateway = NULL;
 static GThread *handler_thread;
 static void *janus_streaming_handler(void *data);
@@ -1329,6 +1330,7 @@ typedef struct janus_streaming_rtp_source {
 	char *rtsp_stream_uri;
 	gboolean rtsp_quirk;
 	gboolean rtsp_tcp;               /* novo: se true, usar RTP/AVP/TCP interleaved */	
+
 	gint64 ka_timeout;
 	char *rtsp_ahost, *rtsp_vhost;
 	janus_streaming_codecs rtsp_acodecs, rtsp_vcodecs;
@@ -1341,6 +1343,7 @@ typedef struct janus_streaming_rtp_source {
 	janus_mutex rtsp_mutex;
 	gboolean played;
 #endif
+	gboolean rtsp_failcheck;
 	/* Only needed for SRTP support */
 	gboolean is_srtp;
 	int srtpsuite;
@@ -2143,6 +2146,14 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 		if(string_ids) {
 			JANUS_LOG(LOG_INFO, "Streaming will use alphanumeric IDs, not numeric\n");
 		}
+		janus_config_item *jrtsp_tcp = janus_config_get(config, config_general, janus_config_type_item, "rtsp_tcp");
+		if(jrtsp_tcp != NULL && jrtsp_tcp->value != NULL)
+			global_rtsp_tcp = janus_is_true(jrtsp_tcp->value);
+		if(global_rtsp_tcp) {
+			JANUS_LOG(LOG_INFO, "All streams will use RTSP TCP transport if not defined in the item!\n");
+		} else {
+			JANUS_LOG(LOG_INFO, "All streams will use RTSP UDP transport if not defined in the item!\n");
+		}
 	}
 	/* Iterate on all mountpoints */
 	mountpoints = g_hash_table_new_full(string_ids ? g_str_hash : g_int64_hash, string_ids ? g_str_equal : g_int64_equal,
@@ -2834,7 +2845,20 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 				}
 				gboolean is_private = priv && priv->value && janus_is_true(priv->value);
 				gboolean rtsp_quirk = quirk && quirk->value && janus_is_true(quirk->value);
-				gboolean rtsp_tcp = tcp && tcp->value && janus_is_true(tcp->value);
+				gboolean rtsp_tcp;
+				if(tcp && tcp->value) {
+					/* Per-item override */
+					rtsp_tcp = janus_is_true(tcp->value);
+					JANUS_LOG(LOG_INFO,
+						"Mountpoint '%s': RTSP transport defined in item, using RTSP %s transport\n",
+						cat->name, rtsp_tcp ? "TCP" : "UDP");
+				} else {
+					/* Fallback to global default */
+					rtsp_tcp = global_rtsp_tcp;
+					JANUS_LOG(LOG_INFO,
+						"Mountpoint '%s': RTSP transport not defined in item, using global RTSP %s transport\n",
+						cat->name, rtsp_tcp ? "TCP" : "UDP");
+				}
 				gboolean doaudio = audio && audio->value && janus_is_true(audio->value);
 				gboolean dovideo = video && video->value && janus_is_true(video->value);
 				gboolean bufferkf = video && vkf && vkf->value && janus_is_true(vkf->value);
@@ -3333,10 +3357,24 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 						json_object_set_new(ml, "rtsp_user", json_string(source->rtsp_username));
 					if(source->rtsp_password)
 						json_object_set_new(ml, "rtsp_pwd", json_string(source->rtsp_password));
+
+					if(source->rtsp_tcp)
+						json_object_set_new(ml, "rtsp_tcp", json_true());	
+					else
+						json_object_set_new(ml, "rtsp_tcp", json_false());	
 					if(source->rtsp_quirk)
 						json_object_set_new(ml, "rtsp_quirk", json_true());
-					if(source->rtsp_tcp)
-						json_object_set_new(ml, "rtsp_tcp", json_true());					
+					else
+						json_object_set_new(ml, "rtsp_quirk", json_false());						
+					if(source->rtsp_failcheck)
+						json_object_set_new(ml, "rtsp_failcheck", json_true());
+					else
+						json_object_set_new(ml, "rtsp_failcheck", json_false());	
+
+					json_object_set_new(ml, "rtsp_reconnect_delay", json_integer(source->reconnect_delay / G_USEC_PER_SEC));
+					json_object_set_new(ml, "rtsp_session_timeout", json_integer(source->session_timeout / G_USEC_PER_SEC));
+					json_object_set_new(ml, "rtsp_timeout", json_integer(source->rtsp_timeout));
+					json_object_set_new(ml, "rtsp_conn_timeout", json_integer(source->rtsp_conn_timeout));			
 				}
 			}
 #endif
@@ -4216,7 +4254,20 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 			gboolean doaudio = audio ? json_is_true(audio) : FALSE;
 			gboolean dovideo = video ? json_is_true(video) : FALSE;
 			gboolean doquirk = quirk ? json_is_true(quirk) : FALSE;
-			gboolean dotcp = tcp ? json_is_true(tcp) : FALSE;
+			gboolean dotcp;
+			if(tcp) {
+				/* Per-item override from JSON */
+				dotcp = json_is_true(tcp);
+				JANUS_LOG(LOG_INFO,
+					"RTSP transport defined in request, this stream will use %s",
+					dotcp ? "TCP" : "UDP");
+			} else {
+				/* Fallback to global default */
+				dotcp = global_rtsp_tcp;
+				JANUS_LOG(LOG_INFO,
+					"RTSP transport not defined in request, this stream will use global %s",
+					dotcp ? "TCP" : "UDP");
+			}
 			gboolean error_on_failure = failerr ? json_is_true(failerr) : TRUE;
 			if(!doaudio && !dovideo) {
 				JANUS_LOG(LOG_ERR, "Can't add 'rtsp' stream, no audio or video have to be streamed...\n");
@@ -4419,8 +4470,29 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 					janus_config_add(config, c, janus_config_item_create("rtsp_pwd", source->rtsp_password));
 				if(source->rtsp_quirk)
 					janus_config_add(config, c, janus_config_item_create("rtsp_quirk", "true"));
+				else
+					janus_config_add(config, c, janus_config_item_create("rtsp_quirk", "false"));
 				if(source->rtsp_tcp)
-					janus_config_add(config, c, janus_config_item_create("rtsp_tcp", "true"));				
+					janus_config_add(config, c, janus_config_item_create("rtsp_tcp", "true"));	
+				else
+					janus_config_add(config, c, janus_config_item_create("rtsp_tcp", "false"));	
+
+				if(source->rtsp_failcheck)
+					janus_config_add(config, c, janus_config_item_create("rtsp_failcheck", "true"));	
+				else
+					janus_config_add(config, c, janus_config_item_create("rtsp_failcheck", "false"));	
+
+				g_snprintf(value, BUFSIZ, "%ld", source->reconnect_delay / G_USEC_PER_SEC);
+				janus_config_add(config, c, janus_config_item_create("rtsp_reconnect_delay", value));
+
+				g_snprintf(value, BUFSIZ, "%ld", source->session_timeout / G_USEC_PER_SEC);
+				janus_config_add(config, c, janus_config_item_create("rtsp_session_timeout", value));
+
+				g_snprintf(value, BUFSIZ, "%d", source->rtsp_timeout);
+				janus_config_add(config, c, janus_config_item_create("rtsp_timeout", value));
+
+				g_snprintf(value, BUFSIZ, "%d", source->rtsp_conn_timeout);
+				janus_config_add(config, c, janus_config_item_create("rtsp_conn_timeout", value));				
 #endif
 				GList *temp = source->media;
 				while(temp) {
@@ -4692,8 +4764,29 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 						janus_config_add(config, c, janus_config_item_create("rtsp_pwd", source->rtsp_password));
 					if(source->rtsp_quirk)
 						janus_config_add(config, c, janus_config_item_create("rtsp_quirk", "true"));
+					else
+						janus_config_add(config, c, janus_config_item_create("rtsp_quirk", "false"));
 					if(source->rtsp_tcp)
-						janus_config_add(config, c, janus_config_item_create("rtsp_tcp", "true"));					
+						janus_config_add(config, c, janus_config_item_create("rtsp_tcp", "true"));	
+					else
+						janus_config_add(config, c, janus_config_item_create("rtsp_tcp", "false"));	
+
+					if(source->rtsp_failcheck)
+						janus_config_add(config, c, janus_config_item_create("rtsp_failcheck", "true"));	
+					else
+						janus_config_add(config, c, janus_config_item_create("rtsp_failcheck", "false"));	
+
+					g_snprintf(value, BUFSIZ, "%ld", source->reconnect_delay / G_USEC_PER_SEC);
+					janus_config_add(config, c, janus_config_item_create("rtsp_reconnect_delay", value));						
+
+					g_snprintf(value, BUFSIZ, "%ld", source->session_timeout / G_USEC_PER_SEC);
+					janus_config_add(config, c, janus_config_item_create("rtsp_session_timeout", value));
+
+					g_snprintf(value, BUFSIZ, "%d", source->rtsp_timeout);
+					janus_config_add(config, c, janus_config_item_create("rtsp_timeout", value));
+
+					g_snprintf(value, BUFSIZ, "%d", source->rtsp_conn_timeout);
+					janus_config_add(config, c, janus_config_item_create("rtsp_conn_timeout", value));
 #endif
 					GList *temp = source->media;
 					while(temp) {
@@ -9642,6 +9735,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		live_rtsp_source->rtsp_acodecs.video_codec = janus_videocodec_from_name(vcodec);
 	live_rtsp_source->rtsp_vcodecs.fmtp = dovideo ? (vfmtp ? g_strdup(vfmtp) : NULL) : NULL;
 	/* If we need to return an error on failure, try connecting right now */
+	live_rtsp_source->rtsp_failcheck = error_on_failure;
 	if(error_on_failure) {
 		/* Now connect to the RTSP server */
 		if(janus_streaming_rtsp_connect_to_server(live_rtsp) < 0) {
