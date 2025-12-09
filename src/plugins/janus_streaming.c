@@ -4259,13 +4259,13 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 				/* Per-item override from JSON */
 				dotcp = json_is_true(tcp);
 				JANUS_LOG(LOG_INFO,
-					"RTSP transport defined in request, this stream will use %s",
+					"RTSP transport defined in request, this stream will use %s\n",
 					dotcp ? "TCP" : "UDP");
 			} else {
 				/* Fallback to global default */
 				dotcp = global_rtsp_tcp;
 				JANUS_LOG(LOG_INFO,
-					"RTSP transport not defined in request, this stream will use global %s",
+					"RTSP transport not defined in request, this stream will use global %s\n",
 					dotcp ? "TCP" : "UDP");
 			}
 			gboolean error_on_failure = failerr ? json_is_true(failerr) : TRUE;
@@ -7600,7 +7600,7 @@ static void janus_streaming_handle_rtp_packet_others(
 		/* Failed to read or not an RTCP packet? */
 		return;
 	}
-	JANUS_LOG(LOG_ERR, "[%s] Got audio/video RTCP feedback: #%d, SSRC %"SCNu32"\n",
+	JANUS_LOG(LOG_HUGE, "[%s] Got audio/video RTCP feedback: #%d, SSRC %"SCNu32"\n",
 		name, stream->mindex, janus_rtcp_get_sender_ssrc(buffer, bytes));
 	/* Relay on all sessions */
 	janus_streaming_rtp_relay_packet packet;
@@ -8818,9 +8818,10 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, source->rtsp_conn_timeout);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 0L);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-	if(source->rtsp_tcp) {
+	// Parece que o ffmpeg usa nagle por padrao, então não usaremos também
+	/*if(source->rtsp_tcp) {
 		curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L); // Force
-	}
+	}*/
 #if CURL_AT_LEAST_VERSION(7, 66, 0)
 #if CURL_AT_LEAST_VERSION(7, 85, 0)
 	curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "rtsp");
@@ -9612,7 +9613,8 @@ static int janus_streaming_rtsp_play(janus_streaming_rtp_source *source, janus_s
 	JANUS_LOG(LOG_VERB, "PLAY answer:%s\n", source->curldata->buffer);
 
 	if (source->rtsp_tcp) {
-		curl_easy_setopt(source->curl, CURLOPT_TIMEOUT_MS, 200L);
+		// Comentei pois em NVR Dahua esse valor é muito baixo o que causa dropar conexão cedo. Agora é rtsp_timeout por padrão
+		//curl_easy_setopt(source->curl, CURLOPT_TIMEOUT_MS, 200L);
 		curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_RECEIVE);
 	}
 
