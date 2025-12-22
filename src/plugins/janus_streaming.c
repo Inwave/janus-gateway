@@ -1599,6 +1599,8 @@ static void janus_streaming_handle_rtp_packet_video(
     janus_streaming_rtp_source_stream *stream,
     char *buffer, int bytes, gint64 now, int index);
 
+static void janus_streaming_buffer_keyframe_data(janus_streaming_rtp_source_stream *stream, char *buffer, int bytes);	
+
 /* Helpers to create an RTP live source (e.g., from gstreamer/ffmpeg/vlc/etc.) */
 janus_streaming_rtp_source_stream *janus_streaming_create_rtp_source_stream(
 		const char *name, int mindex, const char *type, const char *mid, const char *label, const char *msid,
@@ -7983,7 +7985,7 @@ static void janus_streaming_handle_rtp_packet_audio(
 	packet.length = bytes;
 	packet.is_rtp = TRUE;
 	packet.is_video = FALSE;
-	packet.is_keyframe = FALSE;
+	packet.is_kfburst = FALSE;
 	packet.data->type = stream->codecs.pt;
 	/* Is there a recorder? */
 	janus_rtp_header_update(packet.data, &stream->context[0], FALSE, 0);
@@ -8116,7 +8118,7 @@ static void janus_streaming_handle_rtp_packet_video(
 	packet.length = bytes;
 	packet.is_rtp = TRUE;
 	packet.is_video = TRUE;
-	packet.is_keyframe = FALSE;
+	packet.is_kfburst = FALSE;
 	packet.simulcast = stream->simulcast;
 	packet.substream = index;
 	packet.codec = stream->codecs.video_codec;
@@ -8170,7 +8172,7 @@ static void janus_streaming_handle_rtp_packet_video(
 			spspkt.length = stream->h264_spspps_len;
 			spspkt.is_rtp = TRUE;
 			spspkt.is_video = TRUE;
-			spspkt.is_keyframe = FALSE;
+			spspkt.is_kfburst = FALSE;
 			spspkt.simulcast = FALSE;
 			spspkt.codec = stream->codecs.video_codec;
 			spspkt.svc = FALSE;
@@ -10740,9 +10742,10 @@ static void *janus_streaming_relay_thread(void *data) {
 				num++;	/* There's the pipe too */
 			}
 
-			if(num > current_num_fds) {
-				fds = g_realloc(fds, num * sizeof(struct pollfd));
-				current_num_fds = num;
+			if(num > numtot) {
+				/* Reallocate the poll list */
+				numtot = num;
+				fds = g_realloc(fds, numtot * sizeof(struct pollfd));
 			}
 
 			/* Prepare poll */
@@ -10951,8 +10954,9 @@ static void *janus_streaming_relay_thread(void *data) {
 
 	janus_streaming_rtsp_close(source, name, FALSE);
 
-    if(fds != NULL)
+    if(fds != NULL) {
         g_free(fds);
+	}
 
 	/* Notify users this mountpoint is done */
 	janus_mutex_lock(&mountpoint->mutex);
