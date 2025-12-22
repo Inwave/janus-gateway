@@ -207,7 +207,7 @@ static char *janus_pp_extensions_string(const char **allowed, char *supported, s
 
 /* Main Code */
 int main(int argc, char *argv[]) {
-	janus_log_init(FALSE, TRUE, NULL);
+	janus_log_init(FALSE, TRUE, NULL, NULL);
 	atexit(janus_log_destroy);
 
 	/* Initialize some command line options defaults */
@@ -1310,6 +1310,7 @@ int main(int argc, char *argv[]) {
 
 					/* Update current packet ts with new ts */
 					tmp->ts = new_ts;
+					tmp->restamped = 1;
 
 					JANUS_LOG(LOG_WARN, "Timestamp gap detected. Restamping packets from here. Seq: %d\n", tmp->seq);
 					JANUS_LOG(LOG_INFO, "latency=%.2f mavg=%.2f original_ts=%.ld new_ts=%.ld offset=%.ld\n", current_latency, moving_avg_latency, original_ts, tmp->ts, restamping_offset);
@@ -1652,8 +1653,8 @@ static gint janus_pp_skew_compensate_audio(janus_pp_frame_packet *pkt, janus_pp_
 		exit_status = -1;
 	} else {
 		context->target_ts = 0;
-		/* Do not execute analysis for out of order packets or multi-packets frame */
-		if (context->last_seq == context->prev_seq + 1 && context->last_ts != context->prev_ts) {
+		/* Do not execute analysis for out of order packets or multi-packets frame or if pts < start_time */
+		if (context->last_seq == context->prev_seq + 1 && context->last_ts != context->prev_ts && pts >= context->start_time) {
 			/* Evaluate the local RTP timestamp according to the local clock */
 			guint64 expected_ts = ((pts - context->start_time) * akhz) + context->start_ts;
 			/* Evaluate current delay */

@@ -23,6 +23,7 @@ Makefile.in
 /depcomp
 /compile
 /install-sh
+/install-sh~
 /ltmain.sh
 
 /config.log
@@ -60,6 +61,8 @@ npm/src
 .deps
 .dirstamp
 
+cov-int
+
 # OS X
 .DS_Store
 
@@ -68,3 +71,4 @@ npm/src
 
 .vscode
 node_modules
+.venv

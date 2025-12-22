@@ -12,11 +12,12 @@
  * \ref loggers
  */
 
+#include <errno.h>
+
 #include "logger.h"
 
 #include "../debug.h"
 #include "../config.h"
-#include "../mutex.h"
 #include "../utils.h"
 
 
@@ -69,9 +70,8 @@ janus_logger *create(void) {
 
 /* Useful stuff */
 static volatile gint initialized = 0, stopping = 0;
-static GThread *logger_thread;
+static GThread *logger_thread = NULL;
 static void *janus_jsonlog_thread(void *data);
-static janus_mutex logger_mutex;
 
 /* JSON serialization options */
 static size_t json_format = JSON_INDENT(3) | JSON_PRESERVE_ORDER;
@@ -186,7 +186,6 @@ int janus_jsonlog_init(const char *server_name, const char *config_path) {
 
 	/* Initialize the log queue */
 	loglines = g_async_queue_new_full((GDestroyNotify) janus_jsonlog_line_free);
-	janus_mutex_init(&logger_mutex);
 
 	g_atomic_int_set(&initialized, 1);
 
@@ -347,7 +346,8 @@ static void *janus_jsonlog_thread(void *data) {
 			json_len -= written;
 			offset += written;
 		}
-		fwrite("\n", sizeof(char), sizeof("\n"), logfile);
+		const char *lf = "\n";
+		fwrite(lf, sizeof(char), strlen(lf), logfile);
 		fflush(logfile);
 		free(json_text);
 	}
