@@ -7531,11 +7531,26 @@ done:
 				janus_mutex_unlock(&helper->mutex);
 			}
 			session->mountpoint = mp;
+
 			/* Send a PLI too, in case the mountpoint supports video and RTCP */
 			janus_streaming_rtp_source *source = mp->source;
 			GList *temp = source->media;
 			while(temp) {
 				janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
+				if(stream->keyframe.enabled) {
+					JANUS_LOG(LOG_HUGE, "Any keyframe to send? (%s)\n", stream->mid);
+					janus_mutex_lock(&stream->keyframe.mutex);
+					if(stream->keyframe.latest_keyframe != NULL) {
+						JANUS_LOG(LOG_HUGE, "Yep! %d packets\n", g_list_length(stream->keyframe.latest_keyframe));
+						GList *packets = g_list_reverse(g_list_copy(stream->keyframe.latest_keyframe)), *temp = packets;
+						while(temp) {
+							janus_streaming_relay_rtp_packet(session, temp->data);
+							temp = temp->next;
+						}
+						g_list_free(packets);
+					}
+					janus_mutex_unlock(&stream->keyframe.mutex);
+				}				
 				if(stream && stream->type == JANUS_STREAMING_MEDIA_VIDEO)
 					janus_streaming_rtcp_pli_send(source, stream);
 				temp = temp->next;
