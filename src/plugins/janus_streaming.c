@@ -1428,6 +1428,13 @@ typedef struct janus_streaming_rtp_source {
 	int abscapturetime_src_ext_id;
 } janus_streaming_rtp_source;
 
+typedef struct janus_streaming_media_profile {
+	gboolean has_audio, has_video, has_data;
+	janus_audiocodec audio_codec;
+	janus_videocodec video_codec;
+	/* opcional: char *audio_fmtp; char *video_fmtp; */
+} janus_streaming_media_profile;
+
 typedef enum janus_streaming_media {
 	JANUS_STREAMING_MEDIA_NONE = 0,
 	JANUS_STREAMING_MEDIA_AUDIO,
@@ -6230,6 +6237,70 @@ static void janus_streaming_hangup_media_internal(janus_plugin_session *handle) 
 	g_atomic_int_set(&session->hangingup, 0);
 }
 
+static void janus_streaming_profile_from_mountpoint(janus_streaming_mountpoint *mp, janus_streaming_media_profile *p) {
+	memset(p, 0, sizeof(*p));
+	if(mp == NULL || mp->source == NULL)
+		return;
+
+	if(mp->streaming_source != janus_streaming_source_rtp)
+		return;
+
+	janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)mp->source;
+	GList *temp = source->media;
+	while(temp) {
+		janus_streaming_rtp_source_stream *st = (janus_streaming_rtp_source_stream *)temp->data;
+		if(st == NULL) {
+			temp = temp->next;
+			continue;
+		}
+		if(st->type == JANUS_STREAMING_MEDIA_AUDIO) {
+			p->has_audio = TRUE;
+			p->audio_codec = st->codecs.audio_codec;
+		} else if(st->type == JANUS_STREAMING_MEDIA_VIDEO) {
+			p->has_video = TRUE;
+			p->video_codec = st->codecs.video_codec;
+		} else if(st->type == JANUS_STREAMING_MEDIA_DATA) {
+			p->has_data = TRUE;
+		}
+		temp = temp->next;
+	}
+}
+
+static gboolean janus_streaming_switch_is_compatible(janus_streaming_mountpoint *oldmp,
+                                                     janus_streaming_mountpoint *newmp,
+                                                     char *reason, size_t reason_sz) {
+	janus_streaming_media_profile a, b;
+	janus_streaming_profile_from_mountpoint(oldmp, &a);
+	janus_streaming_profile_from_mountpoint(newmp, &b);
+
+	if(a.has_audio != b.has_audio) {
+		g_snprintf(reason, reason_sz, "audio presence differs (%d vs %d)", a.has_audio, b.has_audio);
+		return FALSE;
+	}
+	if(a.has_video != b.has_video) {
+		g_snprintf(reason, reason_sz, "video presence differs (%d vs %d)", a.has_video, b.has_video);
+		return FALSE;
+	}
+	if(a.has_data != b.has_data) {
+		g_snprintf(reason, reason_sz, "data presence differs (%d vs %d)", a.has_data, b.has_data);
+		return FALSE;
+	}
+	if(a.has_audio && a.audio_codec != b.audio_codec) {
+		g_snprintf(reason, reason_sz, "audio codec differs (%s vs %s)",
+			janus_audiocodec_name(a.audio_codec), janus_audiocodec_name(b.audio_codec));
+		return FALSE;
+	}
+	if(a.has_video && a.video_codec != b.video_codec) {
+		g_snprintf(reason, reason_sz, "video codec differs (%s vs %s)",
+			janus_videocodec_name(a.video_codec), janus_videocodec_name(b.video_codec));
+		return FALSE;
+	}
+
+	/* opcional: comparar FMTP relevante aqui */
+
+	return TRUE;
+}
+
 /* Thread to handle incoming messages */
 static void *janus_streaming_handler(void *data) {
 	JANUS_LOG(LOG_VERB, "Joining Streaming handler thread\n");
@@ -7466,7 +7537,25 @@ done:
 				g_snprintf(error_cause, 512, "Can't switch: target is not a live RTP mountpoint");
 				goto error;
 			}
-			/* TODO: compare the streams of the two mountpoints */
+			/* Compare streams: if incompatible, abort switch */
+			char compat_reason[256];
+			if(!janus_streaming_switch_is_compatible(oldmp, mp, compat_reason, sizeof(compat_reason))) {
+				janus_mutex_unlock(&mountpoints_mutex);
+				janus_mutex_unlock(&session->mutex);
+				janus_mutex_unlock(&sessions_mutex);
+
+				JANUS_LOG(LOG_ERR, "Can't switch: incompatible mountpoints (%s -> %s): %s\n",
+					oldmp->id_str, mp->id_str, compat_reason);
+
+				/* drop refs taken for validation */
+				janus_refcount_decrease(&oldmp->ref);
+				janus_refcount_decrease(&mp->ref);
+
+				error_code = JANUS_STREAMING_ERROR_CANT_SWITCH;
+				g_snprintf(error_cause, 512, "Can't switch: incompatible mountpoints (%s)", compat_reason);
+				goto error;
+			}
+			/* Compatible: proceed with normal switch */
 			janus_mutex_unlock(&mountpoints_mutex);
 			JANUS_LOG(LOG_VERB, "Request to switch to mountpoint/stream %s (old: %s)\n", mp->id_str, oldmp->id_str);
 			g_atomic_int_set(&session->paused, 1);
@@ -9650,7 +9739,7 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 
 	/* Do we have media streams already? */
 	if(source->media == NULL) {
-		if(doaudio) {
+		if(doaudio && aresult != -1) {
 			janus_streaming_rtp_source_stream *stream = g_malloc0(sizeof(janus_streaming_rtp_source_stream));
 			stream->mindex = g_list_length(source->media);
 			stream->type = JANUS_STREAMING_MEDIA_AUDIO;
@@ -9659,7 +9748,7 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 			source->media = g_list_append(source->media, stream);
 			janus_refcount_init(&stream->ref, janus_streaming_rtp_source_stream_free);
 		}
-		if(dovideo) {
+		if(dovideo && vresult != -1) {
 			janus_streaming_rtp_source_stream *stream = g_malloc0(sizeof(janus_streaming_rtp_source_stream));
 			stream->mindex = g_list_length(source->media);
 			stream->type = JANUS_STREAMING_MEDIA_VIDEO;
