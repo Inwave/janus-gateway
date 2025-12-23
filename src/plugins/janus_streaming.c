@@ -9238,7 +9238,7 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 	JANUS_LOG(LOG_VERB, "OPTIONS answer:%s\n", curldata->buffer);	
 
 	/* Send an RTSP DESCRIBE */
-	curldata = g_malloc(sizeof(janus_streaming_buffer));
+	g_free(curldata->buffer);
 	curldata->buffer = g_malloc0(1);
 	curldata->size = 0;
 	curl_easy_setopt(curl, CURLOPT_RTSP_STREAM_URI, source->rtsp_url);
@@ -9820,6 +9820,10 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 				stream->keyframe.enabled = TRUE;
 				stream->keyframe.bufferkf_ms = source->bufferkf_ms;
 				stream->keyframe.bufferkf_bytes = source->bufferkf_bytes;
+				/* Não sei foi porque eu coloquei tcp que vaza essa linha
+					de qualquer forma tem que limpar! */
+				if(stream->keyframe.latest_keyframe != NULL)
+					g_list_free_full(stream->keyframe.latest_keyframe, (GDestroyNotify)janus_streaming_rtp_relay_packet_free);
 				stream->keyframe.latest_keyframe = NULL;
 				stream->keyframe.kf_ssrc = 0;
 				stream->keyframe.kf_ts = 0;

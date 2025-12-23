@@ -1672,26 +1672,69 @@ void janus_mqtt_client_publish_status_failure_impl(int rc) {
 }
 
 void janus_mqtt_client_destroy_context(janus_mqtt_context **ptr) {
-	janus_mqtt_context *ctx = (janus_mqtt_context *)*ptr;
-	if(ctx) {
-		MQTTAsync_destroy(&ctx->client);
-		g_free(ctx->subscribe.topic);
-		g_free(ctx->publish.topic);
-		g_free(ctx->connect.username);
-		g_free(ctx->connect.password);
-		janus_mutex_destroy(&ctx->disconnect.mutex);
-		janus_condition_destroy(&ctx->disconnect.cond);
-		g_free(ctx->admin.subscribe.topic);
-		g_free(ctx->admin.publish.topic);
-	#ifdef MQTTVERSION_5
-		g_rw_lock_clear(&janus_mqtt_transaction_states_lock);
-	#endif
-		g_free(ctx);
-		*ptr = NULL;
-	}
+    janus_mqtt_context *ctx = (janus_mqtt_context *)*ptr;
+    if(ctx) {
+        /* Status strings */
+        g_free(ctx->status.connect_message);
+        g_free(ctx->status.disconnect_message);
+        g_free(ctx->status.topic);
 
-	JANUS_LOG(LOG_INFO, "%s destroyed!\n", JANUS_MQTT_NAME);
+        /* SSL strings */
+        g_free(ctx->cacert_file);
+        g_free(ctx->cert_file);
+        g_free(ctx->key_file);
+
+#ifdef MQTTVERSION_5
+        /* proxy_transaction_user_properties: GArray de char* */
+        if(ctx->publish.proxy_transaction_user_properties) {
+            for (guint i = 0; i < ctx->publish.proxy_transaction_user_properties->len; i++) {
+                char *name = g_array_index(ctx->publish.proxy_transaction_user_properties, char*, i);
+                g_free(name);
+            }
+            g_array_free(ctx->publish.proxy_transaction_user_properties, TRUE);
+        }
+
+        /* add_transaction_user_properties: GArray de MQTTProperty com strings duplicadas */
+        if(ctx->publish.add_transaction_user_properties) {
+            for (guint i = 0; i < ctx->publish.add_transaction_user_properties->len; i++) {
+                MQTTProperty *prop =
+                    &g_array_index(ctx->publish.add_transaction_user_properties, MQTTProperty, i);
+                if(prop->identifier == MQTTPROPERTY_CODE_USER_PROPERTY) {
+                    g_free(prop->value.data.data);
+                    g_free(prop->value.value.data);
+                }
+            }
+            g_array_free(ctx->publish.add_transaction_user_properties, TRUE);
+        }
+#endif
+
+        MQTTAsync_destroy(&ctx->client);
+
+        g_free(ctx->subscribe.topic);
+        g_free(ctx->publish.topic);
+        g_free(ctx->connect.username);
+        g_free(ctx->connect.password);
+
+        janus_mutex_destroy(&ctx->disconnect.mutex);
+        janus_condition_destroy(&ctx->disconnect.cond);
+
+        g_free(ctx->admin.subscribe.topic);
+        g_free(ctx->admin.publish.topic);
+
+#ifdef MQTTVERSION_5
+        /* ATENÇÃO: o lock global e a hash de transações idealmente devem ser
+         * destruídos em janus_mqtt_destroy(), depois que a vacuum thread
+         * for parada e junta (g_thread_join). Não aqui dentro do contexto. */
+        /* g_rw_lock_clear(&janus_mqtt_transaction_states_lock); */
+#endif
+
+        g_free(ctx);
+        *ptr = NULL;
+    }
+
+    JANUS_LOG(LOG_INFO, "%s destroyed!\n", JANUS_MQTT_NAME);
 }
+
 
 int janus_mqtt_client_get_response_code(MQTTAsync_failureData *response) {
 	return response ? response->code : 0;
