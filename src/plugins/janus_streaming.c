@@ -8955,6 +8955,8 @@ static size_t janus_streaming_rtsp_interleave_cb(char *ptr, size_t size, size_t 
 				/* Got something audio (RTP) */
 				if(mountpoint->active == FALSE)
 					mountpoint->active = TRUE;
+				
+				gint64 now = janus_get_monotonic_time();
 #ifdef HAVE_LIBCURL
 				source->reconnect_timer = now;
 #endif
@@ -8964,6 +8966,8 @@ static size_t janus_streaming_rtsp_interleave_cb(char *ptr, size_t size, size_t 
 				/* Got something video (RTP) */
 				if(mountpoint->active == FALSE)
 					mountpoint->active = TRUE;
+
+				gint64 now = janus_get_monotonic_time();					
 	#ifdef HAVE_LIBCURL
 				source->reconnect_timer = now;
 	#endif
@@ -8973,9 +8977,12 @@ static size_t janus_streaming_rtsp_interleave_cb(char *ptr, size_t size, size_t 
 				/* Got something data (text) */
 				if(mountpoint->active == FALSE)
 					mountpoint->active = TRUE;
-				stream->last_received[0] = janus_get_monotonic_time();
+				
+				gint64 now = janus_get_monotonic_time();
+
+				stream->last_received[0] = now;
 	#ifdef HAVE_LIBCURL
-				source->reconnect_timer = janus_get_monotonic_time();
+				source->reconnect_timer = now;
 	#endif
 				janus_streaming_handle_rtp_packet_data(name, mountpoint, source, stream, (char*)payload, (int)plen, now, index);
 			}
@@ -10760,8 +10767,8 @@ static void *janus_streaming_relay_thread(void *data) {
 			/* Let's be conservative and send a OPTIONS when half of the timeout has passed */
 			now = janus_get_monotonic_time();
 			if(now-before > ka_timeout && source->curldata) {
-				if(!source->rtsp_tcp) {
-					JANUS_LOG(LOG_VERB, "[%s] %"SCNi64"s passed, sending OPTIONS\n", name, (now-before)/G_USEC_PER_SEC);
+				//if(!source->rtsp_tcp) { // É necessário mandar keep-alive também em TCP se não depois de 90s ele aborta!!!!!!!!
+					JANUS_LOG(LOG_ERR, "[%s] %"SCNi64"s passed, sending OPTIONS\n", name, (now-before)/G_USEC_PER_SEC);
 					before = now;
 					/* Send an RTSP OPTIONS */
 					janus_mutex_lock(&source->rtsp_mutex);
@@ -10776,7 +10783,7 @@ static void *janus_streaming_relay_thread(void *data) {
 							name, curl_easy_strerror(resfd), source->curl_errbuf);
 					}
 					janus_mutex_unlock(&source->rtsp_mutex);
-				}
+				//}
 			}
 		}
 #endif
