@@ -3408,7 +3408,11 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 						g_snprintf(msid, sizeof(msid), "%s %s", stream->msid, stream->mstid);
 						json_object_set_new(info, "msid", json_string(msid));
 					}
-					if(stream->fd[0] != -1 || stream->fd[1] != -1 || stream->fd[2] != -1)
+					gboolean have_transport =
+						(stream->fd[0] != -1 || stream->fd[1] != -1 || stream->fd[2] != -1) ||
+						(source->rtsp_tcp && stream->rtp_channel >= 0);   /* RTSP interleaved pronto */
+
+					if(have_transport)
 						json_object_set_new(info, "age_ms", json_integer((now - stream->last_received[0]) / 1000));
 					json_array_append_new(media, info);
 					temp = temp->next;
@@ -3608,7 +3612,11 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 				}
 				if(stream->type == JANUS_STREAMING_MEDIA_DATA)
 					json_object_set_new(info, "datatype", json_string(stream->textdata ? "text" : "binary"));
-				if(stream->fd[0] != -1 || stream->fd[1] != -1 || stream->fd[2] != -1)
+				gboolean have_transport =
+						(stream->fd[0] != -1 || stream->fd[1] != -1 || stream->fd[2] != -1) ||
+						(source->rtsp_tcp && stream->rtp_channel >= 0);   /* RTSP interleaved pronto */
+
+				if(have_transport)
 					json_object_set_new(info, "age_ms", json_integer((now - stream->last_received[0]) / 1000));
 				janus_mutex_lock(&source->rec_mutex);
 				if(admin && stream->rc && stream->rc->filename)
