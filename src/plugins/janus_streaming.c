@@ -1699,13 +1699,37 @@ static void janus_streaming_session_destroy(janus_streaming_session *session) {
 		janus_refcount_decrease(&session->ref);
 }
 
+static void janus_streaming_session_clear_streams(janus_streaming_session *session) {
+	if(session == NULL)
+		return;
+	if(session->streams != NULL) {
+		g_list_free_full(session->streams, (GDestroyNotify)(janus_streaming_session_stream_free));
+		session->streams = NULL;
+	}
+	if(session->streams_byid != NULL) {
+		g_hash_table_unref(session->streams_byid);
+		session->streams_byid = NULL;
+	}
+}
+
 static void janus_streaming_session_free(const janus_refcount *session_ref) {
 	janus_streaming_session *session = janus_refcount_containerof(session_ref, janus_streaming_session, ref);
-	/* Remove the reference to the core plugin session */
-	janus_refcount_decrease(&session->handle->ref);
+	janus_plugin_session *handle = session->handle;
+	session->handle = NULL;
+	session->mountpoint = NULL;
+
+	janus_streaming_session_clear_streams(session);
+
+	if(handle != NULL)
+		handle->plugin_handle = NULL;
+
+	if(handle != NULL)
+		/* Remove the reference to the core plugin session */
+		janus_refcount_decrease(&handle->ref);
+
 	/* This session can be destroyed, free all the resources */
 	janus_mutex_destroy(&session->mutex);
-	g_free(session);
+	g_free(session);	
 }
 
 static void janus_streaming_mountpoint_destroy(janus_streaming_mountpoint *mountpoint) {
@@ -1961,8 +1985,15 @@ static void janus_streaming_opus_context_cleanup(janus_streaming_opus_context *c
 
 /* Envia bytes interleaved ($, channel, len, payload) no socket RTSP/TCP */
 static int janus_streaming_rtsp_send_interleaved(janus_streaming_rtp_source *source, uint8_t channel, const void *payload, size_t len) {
-	if(source == NULL || !source->rtsp_tcp || source->curl == NULL || payload == NULL || len == 0)
+	if(source == NULL || payload == NULL || len == 0)
 		return -1;
+
+	janus_mutex_lock(&source->rtsp_mutex);
+
+	if(!source->rtsp_tcp || source->curl == NULL) {
+		janus_mutex_unlock(&source->rtsp_mutex);
+		return -1;
+	}
 
 	/* Monta frame interleaved: '$' <channel> <lenBE> <payload> */
 	const size_t hlen = 4;
@@ -1981,6 +2012,7 @@ static int janus_streaming_rtsp_send_interleaved(janus_streaming_rtp_source *sou
 	CURLcode gi = curl_easy_getinfo(source->curl, CURLINFO_ACTIVESOCKET, &s);
 	if(gi != CURLE_OK || s == CURL_SOCKET_BAD) {
 		JANUS_LOG(LOG_ERR, "RTSP interleaved: não consegui obter o socket ativo do libcurl (%s)\n", curl_easy_strerror(gi));
+		janus_mutex_unlock(&source->rtsp_mutex);
 		g_free(buf);
 		return -1;
 	}
@@ -1989,7 +2021,6 @@ static int janus_streaming_rtsp_send_interleaved(janus_streaming_rtp_source *sou
 	size_t left = tot;
 	const unsigned char *p = buf;
 
-	janus_mutex_lock(&source->rtsp_mutex);
 	while(left > 0) {
 	#ifdef MSG_NOSIGNAL
 		sent = send(s, p, left, MSG_NOSIGNAL);
@@ -6095,31 +6126,56 @@ void janus_streaming_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
 }
 
 void janus_streaming_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet) {
-	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
+	if(handle == NULL || packet == NULL || packet->buffer == NULL || packet->length == 0 ||
+			g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) ||
+			!g_atomic_int_get(&initialized))
 		return;
+
 	janus_streaming_session *session = (janus_streaming_session *)handle->plugin_handle;
 	if(!session || g_atomic_int_get(&session->destroyed) || g_atomic_int_get(&session->stopping) ||
 			!g_atomic_int_get(&session->started) || g_atomic_int_get(&session->paused))
 		return;
-	janus_streaming_mountpoint *mp = (janus_streaming_mountpoint *)session->mountpoint;
-	if(mp->streaming_source != janus_streaming_source_rtp)
-		return;
+
+	janus_refcount_increase(&session->ref);
+
+	janus_streaming_mountpoint *mp = NULL;
+	janus_mutex_lock(&session->mutex);
+	if(!g_atomic_int_get(&session->stopping) &&
+			g_atomic_int_get(&session->started) &&
+			!g_atomic_int_get(&session->paused) &&
+			session->mountpoint != NULL) {
+		mp = session->mountpoint;
+		janus_refcount_increase(&mp->ref);
+	}
+	janus_mutex_unlock(&session->mutex);
+
+	if(mp == NULL)
+		goto done;
+	if(g_atomic_int_get(&mp->destroyed) || mp->streaming_source != janus_streaming_source_rtp || mp->source == NULL)
+		goto done;
+
 	janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)mp->source;
 	/* Check which stream this feedback refers to */
 	janus_streaming_rtp_source_stream *stream = g_hash_table_lookup(source->media_byid, GINT_TO_POINTER(packet->mindex));
 	if(stream == NULL)
-		return;
-	gboolean video = packet->video;
+		goto done;		
+
+	gboolean rtcp_backchannel =
+		source->rtsp_tcp || (stream->rtcp_fd > -1 && stream->rtcp_addr.ss_family != 0);
+	if(!rtcp_backchannel)
+		goto done;
+
 	char *buf = packet->buffer;
 	uint16_t len = packet->length;
-	if(!video && (stream->rtcp_fd > -1) && (stream->rtcp_addr.ss_family != 0)) {
+
+	if(!packet->video) {
 		JANUS_LOG(LOG_HUGE, "Got audio RTCP feedback from a viewer: SSRC %"SCNu32"\n",
 			janus_rtcp_get_sender_ssrc(buf, len));
 		/* FIXME We don't forward RR packets, so what should we check here? */
-	} else if(video && (stream->rtcp_fd > -1) && (stream->rtcp_addr.ss_family != 0)) {
+	} else {
 		JANUS_LOG(LOG_HUGE, "Got video RTCP feedback from a viewer: SSRC %"SCNu32"\n",
 			janus_rtcp_get_sender_ssrc(buf, len));
-		/* We only relay PLI/FIR and REMB packets, but in a selective way */
+		/* We only relay PLI/FIR and REMB packets, but in a selective way */			
 		if(janus_rtcp_has_fir(buf, len) || janus_rtcp_has_pli(buf, len)) {
 			/* We got a PLI/FIR, pass it along unless we just sent one */
 			JANUS_LOG(LOG_HUGE, "  -- Keyframe request\n");
@@ -6133,6 +6189,11 @@ void janus_streaming_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rt
 				source->lowest_bitrate = bw;
 		}
 	}
+
+done:
+	if(mp)
+		janus_refcount_decrease(&mp->ref);
+	janus_refcount_decrease(&session->ref);
 }
 
 void janus_streaming_data_ready(janus_plugin_session *handle) {
@@ -6227,19 +6288,11 @@ static void janus_streaming_hangup_media_internal(janus_plugin_session *handle) 
 			}
 		}
 		/* Get rid of streams and streams_byid while holding the mountpoint mutex */
-		g_list_free_full(session->streams, (GDestroyNotify)(janus_streaming_session_stream_free));
-		session->streams = NULL;
-		if(session->streams_byid != NULL)
-			g_hash_table_unref(session->streams_byid);
-		session->streams_byid = NULL;
+		janus_streaming_session_clear_streams(session);
 		janus_mutex_unlock(&mp->mutex);
 	} else {
 		/* Get rid of streams and streams_byid */
-		g_list_free_full(session->streams, (GDestroyNotify)(janus_streaming_session_stream_free));
-		session->streams = NULL;
-		if(session->streams_byid != NULL)
-			g_hash_table_unref(session->streams_byid);
-		session->streams_byid = NULL;
+		janus_streaming_session_clear_streams(session);
 	}
 
 	g_atomic_int_set(&session->hangingup, 0);
@@ -7113,13 +7166,13 @@ done:
 				janus_refcount_increase(&session->ref);
 				janus_refcount_increase(&mp->ref);
 				g_thread_try_new(tname, &janus_streaming_ondemand_thread, session, &error);
-				if(error != NULL) {
+				if(error != NULL) {				
 					JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the on-demand thread...\n",
 						error->code, error->message ? error->message : "??");
 					error_code = JANUS_STREAMING_ERROR_UNKNOWN_ERROR;
 					g_snprintf(error_cause, 512, "Got error %d (%s) trying to launch the on-demand thread",
 						error->code, error->message ? error->message : "??");
-					g_error_free(error);
+					g_error_free(error);				
 				}
 			}
 			g_list_free(subscribed);
@@ -10518,6 +10571,8 @@ static void janus_streaming_rtsp_close(janus_streaming_rtp_source *source, const
 	}
 	GList *temp;
 
+    janus_mutex_lock(&source->rtsp_mutex);
+
 	if(!source->rtsp_tcp) {
 		temp = source->media;
 		while(temp) {
@@ -10531,7 +10586,6 @@ static void janus_streaming_rtsp_close(janus_streaming_rtp_source *source, const
 	}
 
 #ifdef HAVE_LIBCURL
-    janus_mutex_lock(&source->rtsp_mutex);
     if (send_teardown && source->curl && source->rtsp_url && source->curldata) {
         g_free(source->curldata->buffer);
         source->curldata->buffer = g_malloc0(1);
@@ -10546,7 +10600,7 @@ static void janus_streaming_rtsp_close(janus_streaming_rtp_source *source, const
             JANUS_LOG(LOG_VERB, "[%s] RTSP TEARDOWN sent\n", who);
         }
     }
-	janus_mutex_unlock(&source->rtsp_mutex);	
+
     if (source->curl) { curl_easy_cleanup(source->curl); source->curl = NULL; }
     if (source->curl_errbuf) { g_free(source->curl_errbuf); source->curl_errbuf = NULL; }
     if (source->curldata) { g_free(source->curldata->buffer); g_free(source->curldata); source->curldata = NULL; }
@@ -10554,6 +10608,8 @@ static void janus_streaming_rtsp_close(janus_streaming_rtp_source *source, const
     source->reconnecting = FALSE;
     source->reconnect_timer = 0;
     source->remb_latest = 0;
+
+	janus_mutex_unlock(&source->rtsp_mutex);	
 }
 
 /* Helper method to buffer keyframes + deltas, if needed (and if allowed) */
@@ -10776,7 +10832,7 @@ static void *janus_streaming_relay_thread(void *data) {
 			now = janus_get_monotonic_time();
 			if(now-before > ka_timeout && source->curldata) {
 				//if(!source->rtsp_tcp) { // É necessário mandar keep-alive também em TCP se não depois de 90s ele aborta!!!!!!!!
-					JANUS_LOG(LOG_ERR, "[%s] %"SCNi64"s passed, sending OPTIONS\n", name, (now-before)/G_USEC_PER_SEC);
+					JANUS_LOG(LOG_VERB, "[%s] %"SCNi64"s passed, sending OPTIONS\n", name, (now-before)/G_USEC_PER_SEC);
 					before = now;
 					/* Send an RTSP OPTIONS */
 					janus_mutex_lock(&source->rtsp_mutex);
@@ -10799,7 +10855,16 @@ static void *janus_streaming_relay_thread(void *data) {
 
 		if(source->rtsp_tcp) {
 			if(!source->reconnecting && connected && source->played) {
-				CURLcode rc = curl_easy_perform(source->curl);
+				CURLcode rc;
+
+				janus_mutex_lock(&source->rtsp_mutex);
+				if(source->curl == NULL) {
+					janus_mutex_unlock(&source->rtsp_mutex);
+					g_usleep(250000);
+					continue;
+				}
+				janus_mutex_unlock(&source->rtsp_mutex);
+				rc = curl_easy_perform(source->curl);
 
 				if (rc == CURLE_OK || rc == CURLE_OPERATION_TIMEDOUT) { 
 					/* ok: se chegou mídia, seu INTERLEAVEFUNCTION já foi chamado;
