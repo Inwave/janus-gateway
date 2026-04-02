@@ -601,6 +601,7 @@ static janus_transport_callbacks janus_handler_transport =
 		.notify_event = janus_transport_notify_event,
 	};
 static GAsyncQueue *requests = NULL;
+static volatile gint transport_requests_stopping = 0;
 static janus_request exit_message;
 static GThreadPool *tasks = NULL;
 void janus_transport_task(gpointer data, gpointer user_data);
@@ -3473,8 +3474,17 @@ void janus_transportso_close(gpointer key, gpointer value, gpointer user_data) {
 /* Transport callback interface */
 void janus_transport_incoming_request(janus_transport *plugin, janus_transport_session *transport, void *request_id, gboolean admin, json_t *message, json_error_t *error) {
 	JANUS_LOG(LOG_VERB, "Got %s API request from %s (%p)\n", admin ? "an admin" : "a Janus", plugin->get_package(), transport);
+	if(g_atomic_int_get(&transport_requests_stopping) || requests == NULL) {
+		if(message != NULL)
+			json_decref(message);
+		return;
+	}	
 	/* Create a janus_request instance to handle the request */
 	janus_request *request = janus_request_new(plugin, transport, request_id, admin, message, message ? NULL : error);
+	if(g_atomic_int_get(&transport_requests_stopping) || requests == NULL) {
+		janus_request_destroy(request);
+		return;
+	}	
 	/* Enqueue the request, the thread will pick it up */
 	g_async_queue_push(requests, request);
 }
@@ -6006,22 +6016,18 @@ gint main(int argc, char *argv[]) {
 	if(config)
 		janus_config_destroy(config);
 
-	JANUS_LOG(LOG_INFO, "Closing transport plugins:\n");
-	if(transports != NULL && g_hash_table_size(transports) > 0) {
-		g_hash_table_foreach(transports, janus_transport_close, NULL);
-		g_clear_pointer(&transports, g_hash_table_destroy);
-	}
-	if(transports_so != NULL && g_hash_table_size(transports_so) > 0) {
-		g_hash_table_foreach(transports_so, janus_transportso_close, NULL);
-		g_clear_pointer(&transports_so, g_hash_table_destroy);
-	}
-	/* Get rid of requests tasks and thread too */
-	g_thread_pool_free(tasks, FALSE, FALSE);
+	/* Stop accepting new API requests, but keep transports alive for outgoing notifications */
+	accept_new_sessions = FALSE;
+	g_atomic_int_set(&transport_requests_stopping, 1);
+
 	JANUS_LOG(LOG_INFO, "Ending requests thread...\n");
 	g_async_queue_push(requests, &exit_message);
 	g_thread_join(requests_thread);
 	requests_thread = NULL;
-	g_async_queue_unref(requests);
+	if(tasks != NULL) {
+		g_thread_pool_free(tasks, FALSE, FALSE);
+		tasks = NULL;
+	}
 
 	JANUS_LOG(LOG_INFO, "Destroying sessions...\n");
 	g_clear_pointer(&sessions, g_hash_table_destroy);
@@ -6045,6 +6051,20 @@ gint main(int argc, char *argv[]) {
 	if(plugins_so != NULL && g_hash_table_size(plugins_so) > 0) {
 		g_hash_table_foreach(plugins_so, janus_pluginso_close, NULL);
 		g_clear_pointer(&plugins_so, g_hash_table_destroy);
+	}
+
+	JANUS_LOG(LOG_INFO, "Closing transport plugins:\n");
+	if(transports != NULL && g_hash_table_size(transports) > 0) {
+		g_hash_table_foreach(transports, janus_transport_close, NULL);
+		g_clear_pointer(&transports, g_hash_table_destroy);
+	}
+	if(transports_so != NULL && g_hash_table_size(transports_so) > 0) {
+		g_hash_table_foreach(transports_so, janus_transportso_close, NULL);
+		g_clear_pointer(&transports_so, g_hash_table_destroy);
+	}
+	if(requests != NULL) {
+		g_async_queue_unref(requests);
+		requests = NULL;
 	}
 
 	JANUS_LOG(LOG_INFO, "Closing event handlers:\n");
