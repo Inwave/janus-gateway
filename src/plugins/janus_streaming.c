@@ -5864,13 +5864,15 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 				GList *temp = source->media;
 				while(temp) {
 					janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
-					/* Close the recording */
-					janus_recorder_close(stream->rc);
-					JANUS_LOG(LOG_INFO, "[%s] Closed %s recording %s (%s)\n", mp->name,
-						janus_streaming_media_str(stream->type), stream->rc->filename, stream->mid);
-					janus_recorder *tmp = stream->rc;
-					stream->rc = NULL;
-					janus_recorder_destroy(tmp);
+					if(stream->rc != NULL) {
+						/* Close the recording */
+						janus_recorder_close(stream->rc);
+						JANUS_LOG(LOG_INFO, "[%s] Closed %s recording %s (%s)\n", mp->name,
+							janus_streaming_media_str(stream->type), stream->rc->filename, stream->mid);
+						janus_recorder *tmp = stream->rc;
+						stream->rc = NULL;
+						janus_recorder_destroy(tmp);
+					}
 					temp = temp->next;
 				}
 				janus_mutex_unlock(&source->rec_mutex);
@@ -10896,12 +10898,14 @@ static void *janus_streaming_relay_thread(void *data) {
 					GList *temp = source->media;
 					while(temp) {
 						janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
-						janus_recorder_close(stream->rc);
-						JANUS_LOG(LOG_INFO, "[%s] Closed %s recording %s (%s)\n", mountpoint->name,
-							janus_streaming_media_str(stream->type), stream->rc->filename, stream->mid);
-						janus_recorder *tmp = stream->rc;
-						stream->rc = NULL;
-						janus_recorder_destroy(tmp);
+						if(stream->rc != NULL) {
+							janus_recorder_close(stream->rc);
+							JANUS_LOG(LOG_INFO, "[%s] Closed %s recording %s (%s)\n", mountpoint->name,
+								janus_streaming_media_str(stream->type), stream->rc->filename, stream->mid);
+							janus_recorder *tmp = stream->rc;
+							stream->rc = NULL;
+							janus_recorder_destroy(tmp);
+						}
 						break;
 					}
 					janus_mutex_unlock(&source->rec_mutex);	
@@ -10998,12 +11002,14 @@ static void *janus_streaming_relay_thread(void *data) {
 				GList *temp = source->media;
 				while(temp) {
 					janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
-					janus_recorder_close(stream->rc);
-					JANUS_LOG(LOG_INFO, "[%s] Closed %s recording %s (%s)\n", mountpoint->name,
-						janus_streaming_media_str(stream->type), stream->rc->filename, stream->mid);
-					janus_recorder *tmp = stream->rc;
-					stream->rc = NULL;
-					janus_recorder_destroy(tmp);
+					if(stream->rc != NULL) {
+						janus_recorder_close(stream->rc);
+						JANUS_LOG(LOG_INFO, "[%s] Closed %s recording %s (%s)\n", mountpoint->name,
+							janus_streaming_media_str(stream->type), stream->rc->filename, stream->mid);
+						janus_recorder *tmp = stream->rc;
+						stream->rc = NULL;
+						janus_recorder_destroy(tmp);
+					}
 					break;
 				}
 				janus_mutex_unlock(&source->rec_mutex);
@@ -11023,12 +11029,14 @@ static void *janus_streaming_relay_thread(void *data) {
 					GList *temp = source->media;
 					while(temp) {
 						janus_streaming_rtp_source_stream *stream = (janus_streaming_rtp_source_stream *)temp->data;
-						janus_recorder_close(stream->rc);
-						JANUS_LOG(LOG_INFO, "[%s] Closed %s recording %s (%s)\n", mountpoint->name,
-							janus_streaming_media_str(stream->type), stream->rc->filename, stream->mid);
-						janus_recorder *tmp = stream->rc;
-						stream->rc = NULL;
-						janus_recorder_destroy(tmp);
+						if(stream->rc != NULL) {
+							janus_recorder_close(stream->rc);
+							JANUS_LOG(LOG_INFO, "[%s] Closed %s recording %s (%s)\n", mountpoint->name,
+								janus_streaming_media_str(stream->type), stream->rc->filename, stream->mid);
+							janus_recorder *tmp = stream->rc;
+							stream->rc = NULL;
+							janus_recorder_destroy(tmp);
+						}
 						break;
 					}
 					janus_mutex_unlock(&source->rec_mutex);
