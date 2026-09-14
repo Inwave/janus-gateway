@@ -38,14 +38,18 @@ class RtspServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def __init__(self):
         super().__init__(("127.0.0.1", 0), RtspHandler)
         self.play_count = 0
+        self.play_counts = {}
         self.play_condition = threading.Condition()
         self.keepalive_counts = {}
         self.keepalive_condition = threading.Condition()
         self.options_burst = threading.Event()
+        self.paused_streams = set()
+        self.pause_lock = threading.Lock()
 
-    def played(self):
+    def played(self, stream_name):
         with self.play_condition:
             self.play_count += 1
+            self.play_counts[stream_name] = self.play_counts.get(stream_name, 0) + 1
             self.play_condition.notify_all()
 
     def wait_for_plays(self, expected, timeout):
@@ -57,6 +61,27 @@ class RtspServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                     return False
                 self.play_condition.wait(remaining)
             return True
+
+    def wait_for_stream_plays(self, stream_name, expected, timeout):
+        deadline = time.monotonic() + timeout
+        with self.play_condition:
+            while self.play_counts.get(stream_name, 0) < expected:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.play_condition.wait(remaining)
+            return True
+
+    def pause_stream(self, stream_name, paused):
+        with self.pause_lock:
+            if paused:
+                self.paused_streams.add(stream_name)
+            else:
+                self.paused_streams.discard(stream_name)
+
+    def stream_is_paused(self, stream_name):
+        with self.pause_lock:
+            return stream_name in self.paused_streams
 
     def kept_alive(self, session_id):
         with self.keepalive_condition:
@@ -85,9 +110,14 @@ class RtspHandler(socketserver.BaseRequestHandler):
         timestamp = 0
         next_packet = time.monotonic()
         session_id = f"local-{self.request.fileno()}"
+        stream_name = None
         recent_options = []
         while True:
-            if playing and time.monotonic() >= next_packet:
+            if (
+                playing
+                and not self.server.stream_is_paused(stream_name)
+                and time.monotonic() >= next_packet
+            ):
                 rtp = struct.pack("!BBHII", 0x80, 96, sequence, timestamp, 1) + b"\x65\x00"
                 frame = b"$\x00" + struct.pack("!H", len(rtp)) + rtp
                 try:
@@ -142,6 +172,7 @@ class RtspHandler(socketserver.BaseRequestHandler):
                             playing = False
                     response_headers.append("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN")
                 elif method == "DESCRIBE":
+                    stream_name = uri.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
                     body = SDP
                     response_headers.extend(
                         [
@@ -156,7 +187,7 @@ class RtspHandler(socketserver.BaseRequestHandler):
                     response_headers.append(f"Transport: {transport}")
                 elif method == "PLAY":
                     playing = True
-                    self.server.played()
+                    self.server.played(stream_name)
                 elif method == "TEARDOWN":
                     playing = False
                 response_headers.append(f"Content-Length: {len(body)}")
@@ -242,6 +273,19 @@ def plugin_message(port, session_id, handle_id, body, timeout=2.0):
         {"janus": "message", "body": body, "transaction": transaction(body["request"])},
         timeout,
     )
+
+
+def plugin_result(response):
+    return response.get("plugindata", {}).get("data", {})
+
+
+def no_media_counts(response):
+    mountpoints = plugin_result(response).get("list", [])
+    return {
+        mountpoint["id"]: mountpoint["rtsp_no_media_count"]
+        for mountpoint in mountpoints
+        if "rtsp_no_media_count" in mountpoint
+    }
 
 
 def wait_for_plugin_result(port, session_id, key, timeout):
@@ -479,6 +523,87 @@ def run(args):
                         raise AssertionError(
                             f"RTSP sources reconnected unexpectedly: {rtsp.play_count} PLAYs"
                         )
+                    initial_counts = no_media_counts(continuity)
+                    if set(initial_counts) != {1, 2}:
+                        raise AssertionError(
+                            "list did not expose an RTSP no-media counter for each "
+                            f"mountpoint: {initial_counts}"
+                        )
+                    initial_info = plugin_message(
+                        http_port,
+                        session_id,
+                        handle_id,
+                        {"request": "info", "id": 1},
+                        timeout=1.0,
+                    )
+                    info_count = plugin_result(initial_info).get("info", {}).get(
+                        "rtsp_no_media_count"
+                    )
+                    if info_count != initial_counts[1]:
+                        raise AssertionError(
+                            "info and list disagree on the RTSP no-media counter: "
+                            f"{info_count} != {initial_counts[1]}"
+                        )
+
+                    # Stop media on only one mountpoint. Janus must detect it,
+                    # reconnect that RTSP source, and expose one additional event
+                    # without changing the other mountpoint's counter.
+                    rtsp.pause_stream("stream1", True)
+                    if not rtsp.wait_for_stream_plays("stream1", 2, 4.0):
+                        raise AssertionError(
+                            "Janus did not reconnect stream1 after media stopped: "
+                            f"{rtsp.play_counts}"
+                        )
+                    rtsp.pause_stream("stream1", False)
+
+                    deadline = time.monotonic() + 2.0
+                    observed_counts = None
+                    observed_ages = None
+                    while time.monotonic() < deadline:
+                        observed = plugin_message(
+                            http_port,
+                            session_id,
+                            handle_id,
+                            {"request": "list"},
+                            timeout=1.0,
+                        )
+                        observed_counts = no_media_counts(observed)
+                        observed_mountpoints = plugin_result(observed).get("list", [])
+                        observed_ages = {
+                            mountpoint["id"]: media["age_ms"]
+                            for mountpoint in observed_mountpoints
+                            for media in mountpoint.get("media", [])
+                            if "age_ms" in media
+                        }
+                        if (
+                            observed_counts.get(1) == initial_counts[1] + 1
+                            and observed_counts.get(2) == initial_counts[2]
+                            and observed_ages.get(1, 1000) < 500
+                        ):
+                            break
+                        time.sleep(0.05)
+                    else:
+                        raise AssertionError(
+                            "per-mountpoint no-media counter did not reflect exactly "
+                            "one stream1 reconnect: "
+                            f"counts={observed_counts}, ages={observed_ages}"
+                        )
+
+                    final_info = plugin_message(
+                        http_port,
+                        session_id,
+                        handle_id,
+                        {"request": "info", "id": 1},
+                        timeout=1.0,
+                    )
+                    final_info_count = plugin_result(final_info).get("info", {}).get(
+                        "rtsp_no_media_count"
+                    )
+                    if final_info_count != observed_counts[1]:
+                        raise AssertionError(
+                            "info did not expose the updated RTSP no-media counter: "
+                            f"{final_info_count} != {observed_counts[1]}"
+                        )
                 else:
                     if switch_result is not None:
                         raise AssertionError("vulnerable plugin unexpectedly completed switch")
@@ -534,7 +659,7 @@ def run(args):
             raise AssertionError("vulnerable shutdown did not reach the expected wait point")
         verified = "switch/list/attach/shutdown"
         if args.expect == "fixed":
-            verified = "switch/list/attach/keepalive/media/shutdown"
+            verified = "switch/list/attach/keepalive/media/no-media-counter/shutdown"
         print(f"RTSP/TCP E2E {args.expect}: {verified} behavior verified")
 
 

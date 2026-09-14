@@ -59,7 +59,10 @@ plugin tries to send interleaved RTCP. The test verifies that `switch`, `list`, 
 new session/attach and graceful shutdown remain bounded. It also uses a short
 RTSP session timeout to prove that periodic keepalive `OPTIONS` requests are
 sent without a burst, the easy handle returns to `RECEIVE`, media remains fresh
-and no reconnect is triggered.
+and no reconnect is triggered. Finally, it pauses media on only one fake camera
+and verifies that `rtsp_no_media_count` increments only for that mountpoint and
+has the same value in the Streaming `list` and `info` responses. The counter is
+cumulative for the lifetime of the RTSP mountpoint.
 
 After building Janus, run the fixed-code regression with:
 
@@ -70,3 +73,26 @@ make check-streaming-rtsp-e2e
 The script also accepts `--expect vulnerable` so the same fault can document the
 pre-fix lock cascade against an explicitly supplied older plugin build. It uses
 only Python's standard library and a C compiler; all sockets bind to `127.0.0.1`.
+
+## RTP/UDP Streaming compatibility test
+
+`streaming_rtp_udp_e2e.py` starts Janus with one loopback RTP mountpoint, sends
+real RTP packets over UDP and verifies fresh `age_ms` values in both `list` and
+`info`, the absence of RTSP-only fields and graceful shutdown. This exercises
+the UDP fallback in builds both with and without libcurl:
+
+```bash
+make check-streaming-rtp-e2e
+```
+
+When validating artifacts explicitly built without libcurl, invoke the script
+with `--expect-no-curl` so it also checks the plugin's runtime capability
+warning:
+
+```bash
+python3 test/streaming_rtp_udp_e2e.py \
+  --janus /path/to/janus \
+  --plugin /path/to/libjanus_streaming.so \
+  --transport /path/to/libjanus_http.so \
+  --expect-no-curl
+```
