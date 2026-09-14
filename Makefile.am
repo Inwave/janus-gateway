@@ -18,6 +18,8 @@ test_test_streaming_rtsp_io_SOURCES = \
 	src/plugins/janus_streaming_rtsp_io.h
 EXTRA_DIST += \
 	test/force_rtcp_eagain.c \
+	test/slow_streaming_path.c \
+	test/streaming_slow_viewer_e2e.py \
 	test/streaming_rtsp_tcp_e2e.py \
 	test/streaming_rtp_udp_e2e.py
 
@@ -34,7 +36,14 @@ check-streaming-rtsp-e2e:
 		--transport $(abs_builddir)/src/transports/.libs/libjanus_http.so \
 		--expect fixed
 
-.PHONY: check-streaming-rtp-e2e check-streaming-rtsp-e2e
+check-streaming-slow-viewer-e2e:
+	python3 $(srcdir)/test/streaming_slow_viewer_e2e.py \
+		--janus $(abs_builddir)/src/janus \
+		--plugin $(abs_builddir)/src/plugins/.libs/libjanus_streaming.so \
+		--transport $(abs_builddir)/src/transports/.libs/libjanus_http.so
+
+.PHONY: check-streaming-rtp-e2e check-streaming-rtsp-e2e \
+	check-streaming-slow-viewer-e2e
 
 confdir = $(sysconfdir)/janus
 conf_DATA = conf/janus.jcfg.sample

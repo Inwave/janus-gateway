@@ -79,6 +79,28 @@ The script also accepts `--expect vulnerable` so the same fault can document the
 pre-fix lock cascade against an explicitly supplied older plugin build. It uses
 only Python's standard library and a C compiler; all sockets bind to `127.0.0.1`.
 
+## Streaming slow-viewer and helper-thread test
+
+`streaming_slow_viewer_e2e.py` starts three RTSP/TCP mountpoints configured with
+`threads=0`, `threads=1` and `threads=2`, plus two real WebRTC viewers per
+mountpoint. A local `LD_PRELOAD` shim first delays the core's WebRTC socket
+handoff. The test proves that this creates backpressure in each ICE handle while
+RTSP draining and per-viewer throughput remain equivalent for all three helper
+counts. It then delays the plugin-to-core relay call instead, proving the
+different property helper threads provide: one helper isolates RTSP reception,
+while two helpers let the two viewers progress independently.
+
+The test requires the `aiortc` dependency from `test/requirements.txt` and a C
+compiler. After building Janus with the HTTP transport and libcurl, run:
+
+```bash
+make check-streaming-slow-viewer-e2e
+```
+
+The test uses no external endpoint: Janus and the fake RTSP/HTTP servers run in
+the same local environment. Fault injection is enabled only after all six
+PeerConnections are established.
+
 ## RTP/UDP Streaming compatibility test
 
 `streaming_rtp_udp_e2e.py` starts Janus with one loopback RTP mountpoint, sends
