@@ -50,3 +50,20 @@ The scripts must be invoked like this:
 It will start a Janus instance in the background taking the binary files from the Janus sources directory.
 Then it will wait for some seconds before invoking the Python script specified in the first parameter.
 Finally it will check the exit status of the Python script and kill the Janus instance.
+
+## RTSP/TCP Streaming regression test
+
+`streaming_rtsp_tcp_e2e.py` starts two loopback-only fake RTSP cameras and a
+Janus instance. A local `LD_PRELOAD` shim forces `EAGAIN` only when the Streaming
+plugin tries to send interleaved RTCP. The test verifies that `switch`, `list`, a
+new session/attach and graceful shutdown remain bounded.
+
+After building Janus, run the fixed-code regression with:
+
+```bash
+make check-streaming-rtsp-e2e
+```
+
+The script also accepts `--expect vulnerable` so the same fault can document the
+pre-fix lock cascade against an explicitly supplied older plugin build. It uses
+only Python's standard library and a C compiler; all sockets bind to `127.0.0.1`.
