@@ -22,6 +22,8 @@ from streaming_rtsp_tcp_e2e import (
     create_session,
     free_port,
     get_events,
+    plugin_message,
+    plugin_result,
     post_json,
     transaction,
     wait_for_api,
@@ -53,6 +55,7 @@ class PressureRtspServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.payload_size = payload_size
         self.sent_counts = collections.Counter()
         self.play_counts = collections.Counter()
+        self.pli_counts = collections.Counter()
         self.lock = threading.Lock()
 
     def sent(self, stream_name):
@@ -62,6 +65,15 @@ class PressureRtspServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def played(self, stream_name):
         with self.lock:
             self.play_counts[stream_name] += 1
+
+    def feedback(self, stream_name, packet):
+        if len(packet) >= 2 and packet[1] == 206 and packet[0] & 0x1F == 1:
+            with self.lock:
+                self.pli_counts[stream_name] += 1
+
+    def feedback_snapshot(self):
+        with self.lock:
+            return dict(self.pli_counts)
 
     def snapshot(self):
         with self.lock:
@@ -176,7 +188,11 @@ class PressureRtspHandler(socketserver.BaseRequestHandler):
                         frame_length = struct.unpack("!H", incoming[2:4])[0]
                         if len(incoming) < 4 + frame_length:
                             break
+                        channel = incoming[1]
+                        packet = incoming[4 : 4 + frame_length]
                         incoming = incoming[4 + frame_length :]
+                        if channel % 2 == 1:
+                            self.server.feedback(stream_name, packet)
                         continue
                     header_end = incoming.find(b"\r\n\r\n")
                     if header_end < 0:
@@ -256,7 +272,15 @@ def write_configs(
             "}\n"
         )
     (config_dir / "janus.plugin.streaming.jcfg").write_text(
-        "general: { events = false }\n" + "".join(streams), encoding="utf-8"
+        "general: {\n"
+        "  events = false\n"
+        "  helper_queue_max_packets = 32\n"
+        "  helper_queue_max_bytes = 65536\n"
+        "  helper_queue_max_age_ms = 2000\n"
+        "  helper_queue_global_max_bytes = 65536\n"
+        "}\n"
+        + "".join(streams),
+        encoding="utf-8",
     )
     return config_dir
 
@@ -354,6 +378,19 @@ async def queued_packets(admin_port, viewer):
     if response.get("janus") != "success":
         raise AssertionError(f"handle_info failed: {response}")
     return response.get("info", {}).get("queued-packets", -1)
+
+
+async def helper_queue_info(port, viewer, mountpoint_id):
+    session_id, handle_id, _ = viewer
+    response = await asyncio.to_thread(
+        plugin_message,
+        port,
+        session_id,
+        handle_id,
+        {"request": "info", "id": mountpoint_id},
+        2.0,
+    )
+    return plugin_result(response).get("info", {}).get("helper_queue")
 
 
 def packet_deltas(before, after):
@@ -460,6 +497,7 @@ async def exercise(
             )
 
         await asyncio.sleep(2.0)
+        initial_plis = rtsp.feedback_snapshot()
         relay_sent, relay_received, _, plays = await measure_phase(
             viewers, rtsp, admin_port, relay_trigger_path, duration
         )
@@ -477,6 +515,62 @@ async def exercise(
             )
         if relay_sent[2] < relay_sent[1] * 0.85:
             raise AssertionError(f"two helpers reduced source draining: sent={relay_sent}")
+        helper_queues = {
+            helpers: await helper_queue_info(
+                port, viewers[helpers][0], helpers + 1
+            )
+            for helpers in (0, 1, 2)
+        }
+        if helper_queues[0] is not None:
+            raise AssertionError(
+                f"threads=0 unexpectedly exposed helper metrics: {helper_queues[0]}"
+            )
+        for helpers in (1, 2):
+            queue = helper_queues[helpers]
+            if queue is None:
+                raise AssertionError(f"threads={helpers} did not expose helper metrics")
+            if (
+                queue.get("max_packets_per_helper") != 32
+                or queue.get("max_bytes_per_helper") != 65536
+                or queue.get("max_age_ms") != 2000
+                or queue.get("global_max_bytes") != 65536
+            ):
+                raise AssertionError(f"unexpected helper limits: {queue}")
+            if helpers == 1 and queue.get("dropped_packets", 0) < 1:
+                raise AssertionError(
+                    f"threads={helpers} did not shed a slow helper backlog: {queue}"
+                )
+            if queue.get("current_packets", 0) > helpers * 32:
+                raise AssertionError(f"helper packet limit was exceeded: {queue}")
+            if queue.get("current_bytes", 0) > helpers * 65536:
+                raise AssertionError(f"helper byte limit was exceeded: {queue}")
+            if queue.get("oldest_age_ms", 0) > 2000:
+                raise AssertionError(f"helper age limit was exceeded: {queue}")
+            if queue.get("global_current_bytes", 0) > 65536:
+                raise AssertionError(f"global helper byte limit was exceeded: {queue}")
+            if queue.get("global_peak_bytes", 0) > 65536:
+                raise AssertionError(f"global helper peak limit was exceeded: {queue}")
+            for entry in queue.get("helpers", []):
+                if entry.get("peak_packets", 0) > 32:
+                    raise AssertionError(f"helper peak packet limit was exceeded: {entry}")
+                if entry.get("peak_bytes", 0) > 65536:
+                    raise AssertionError(f"helper peak byte limit was exceeded: {entry}")
+            if helpers == 1 and queue.get("packet_limit_hits", 0) < 1:
+                raise AssertionError(f"helper packet limit was not reached: {queue}")
+            if helpers == 1 and not any(
+                entry.get("dropped_oldest_packets", 0) > 0
+                for entry in queue.get("helpers", [])
+            ):
+                raise AssertionError(f"helper did not discard its oldest backlog: {queue}")
+        await asyncio.sleep(1.2)
+        final_plis = rtsp.feedback_snapshot()
+        for helpers in (1,):
+            stream = f"stream{helpers}"
+            if final_plis.get(stream, 0) <= initial_plis.get(stream, 0):
+                raise AssertionError(
+                    "dropping delayed video did not request a new keyframe: "
+                    f"before={initial_plis}, after={final_plis}"
+                )
         return {
             "slow_outbound": {
                 "source_packets": outbound_sent,
@@ -486,6 +580,9 @@ async def exercise(
             "slow_relay": {
                 "source_packets": relay_sent,
                 "viewer_packets": relay_received,
+                "helper_queues": helper_queues,
+                "pli_before": initial_plis,
+                "pli_after": final_plis,
             },
         }
     finally:

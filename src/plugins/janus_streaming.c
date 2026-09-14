@@ -125,6 +125,13 @@ threads = number of threads to assist with the relaying part, which can help
 	if you expect a lot of viewers that may cause the RTP receiving part
 	in the Streaming plugin to slow down and fail to catch up (default=0)
 
+Helper-thread queues are globally bounded by the general settings
+helper_queue_max_packets (default=256), helper_queue_max_bytes
+(default=2097152), helper_queue_max_age_ms (default=2000), and
+helper_queue_global_max_bytes (default=67108864). When delivery cannot
+keep up, the oldest live packets are discarded and video keyframes are
+requested so helpers catch up without allowing memory to grow indefinitely.
+
 Note: by default, the Streaming plugin only forwards the latest packets
 it receives, never performing any buffering. This means that, for video
 streams, new viewers may initially start receiving frames they cannot
@@ -983,6 +990,7 @@ multistream-test: {
 #include "../utils.h"
 #include "../sdp-utils.h"
 #include "../ip-utils.h"
+#include "janus_streaming_queue_limits.h"
 #include "janus_streaming_rtsp_io.h"
 
 /* Default settings */
@@ -991,6 +999,11 @@ multistream-test: {
 #define JANUS_STREAMING_DEFAULT_CURL_TIMEOUT 10L /* Communication timeout for cURL. */
 #define JANUS_STREAMING_DEFAULT_CURL_CONNECT_TIMEOUT 5L /* Connection timeout for cURL. */
 #define JANUS_STREAMING_RTCP_SEND_TIMEOUT_MS 250
+#define JANUS_STREAMING_HELPER_QUEUE_MAX_PACKETS 256
+#define JANUS_STREAMING_HELPER_QUEUE_MAX_BYTES (2 * 1024 * 1024)
+#define JANUS_STREAMING_HELPER_QUEUE_MAX_AGE_MS 2000
+#define JANUS_STREAMING_HELPER_QUEUE_GLOBAL_MAX_BYTES (64 * 1024 * 1024)
+#define JANUS_STREAMING_HELPER_QUEUE_LOG_INTERVAL_US (60 * G_USEC_PER_SEC)
 
 /* Plugin information */
 #define JANUS_STREAMING_VERSION			11
@@ -1292,6 +1305,14 @@ static gboolean notify_events = TRUE;
 static gboolean string_ids = FALSE;
 static gboolean global_rtsp_tcp = FALSE;
 static gboolean ipv6_disabled = FALSE;
+static janus_streaming_queue_limits helper_queue_limits = {
+	.max_packets = JANUS_STREAMING_HELPER_QUEUE_MAX_PACKETS,
+	.max_bytes = JANUS_STREAMING_HELPER_QUEUE_MAX_BYTES,
+	.max_age_us = JANUS_STREAMING_HELPER_QUEUE_MAX_AGE_MS * G_TIME_SPAN_MILLISECOND,
+};
+static janus_streaming_queue_budget helper_queue_global_budget = {
+	.max_bytes = JANUS_STREAMING_HELPER_QUEUE_GLOBAL_MAX_BYTES,
+};
 static janus_callbacks *gateway = NULL;
 static GThread *handler_thread;
 static void *janus_streaming_handler(void *data);
@@ -1357,11 +1378,19 @@ typedef struct janus_streaming_rtp_relay_packet {
 	janus_vp9_svc_info svc_info;
 	/* The following is only relevant for datachannels */
 	gboolean textdata;
+	/* The following are only relevant to helper-thread queue accounting */
+	gint64 queued_at;
+	guint queued_bytes;
+	gboolean helper_queued;
 } janus_streaming_rtp_relay_packet;
 static janus_streaming_rtp_relay_packet exit_packet;
 static void janus_streaming_rtp_relay_packet_free(janus_streaming_rtp_relay_packet *pkt) {
 	if(pkt == NULL || pkt == &exit_packet)
 		return;
+	if(pkt->helper_queued) {
+		janus_streaming_queue_budget_release(&helper_queue_global_budget, pkt->queued_bytes);
+		pkt->helper_queued = FALSE;
+	}
 	g_free(pkt->data);
 	g_free(pkt);
 
@@ -1570,6 +1599,19 @@ typedef struct janus_streaming_helper {
 	int num_viewers;
 	GList *viewers;
 	GAsyncQueue *queued_packets;
+	guint queue_packets;
+	guint64 queue_bytes;
+	guint peak_queue_packets;
+	guint64 peak_queue_bytes;
+	guint64 dropped_packets;
+	guint64 dropped_bytes;
+	guint64 dropped_oldest_packets;
+	guint64 packet_limit_hits;
+	guint64 byte_limit_hits;
+	guint64 age_limit_hits;
+	guint64 global_limit_hits;
+	gboolean queue_pressure;
+	gint64 queue_last_warning;
 	volatile gint destroyed;
 	janus_mutex mutex;
 	janus_refcount ref;
@@ -1589,6 +1631,309 @@ static void janus_streaming_helper_free(const janus_refcount *helper_ref) {
 }
 static void *janus_streaming_helper_thread(void *data);
 static void janus_streaming_helper_rtprtcp_packet(gpointer data, gpointer user_data);
+
+static void janus_streaming_helper_release_packet_unlocked(janus_streaming_helper *helper,
+		janus_streaming_rtp_relay_packet *packet) {
+	if(helper == NULL || packet == NULL || packet == &exit_packet || !packet->helper_queued)
+		return;
+	if(helper->queue_packets > 0)
+		helper->queue_packets--;
+	if(helper->queue_bytes >= packet->queued_bytes)
+		helper->queue_bytes -= packet->queued_bytes;
+	else
+		helper->queue_bytes = 0;
+	packet->helper_queued = FALSE;
+	janus_streaming_queue_budget_release(&helper_queue_global_budget, packet->queued_bytes);
+}
+
+static void janus_streaming_helper_record_drop_unlocked(janus_streaming_helper *helper,
+		janus_streaming_rtp_relay_packet *packet, gboolean *video_dropped) {
+	helper->dropped_packets++;
+	helper->dropped_bytes += packet->queued_bytes;
+	helper->queue_pressure = TRUE;
+	if(packet->is_rtp && packet->is_video && video_dropped != NULL)
+		*video_dropped = TRUE;
+}
+
+static gboolean janus_streaming_helper_drop_oldest_unlocked(janus_streaming_helper *helper,
+		gboolean *video_dropped) {
+	janus_streaming_rtp_relay_packet *packet = janus_streaming_queue_take_oldest_unlocked(
+		helper->queued_packets, &exit_packet);
+	if(packet == NULL)
+		return FALSE;
+	janus_streaming_helper_release_packet_unlocked(helper, packet);
+	janus_streaming_helper_record_drop_unlocked(helper, packet, video_dropped);
+	helper->dropped_oldest_packets++;
+	janus_streaming_rtp_relay_packet_free(packet);
+	return TRUE;
+}
+
+static janus_streaming_rtp_relay_packet *janus_streaming_helper_peek_unlocked(
+		janus_streaming_helper *helper) {
+	janus_streaming_rtp_relay_packet *packet = g_async_queue_try_pop_unlocked(helper->queued_packets);
+	if(packet != NULL)
+		g_async_queue_push_front_unlocked(helper->queued_packets, packet);
+	return packet;
+}
+
+static void janus_streaming_helper_schedule_keyframe(janus_streaming_helper *helper) {
+	if(helper == NULL || helper->mp == NULL ||
+			helper->mp->streaming_source != janus_streaming_source_rtp)
+		return;
+	janus_streaming_rtp_source *source = helper->mp->source;
+	if(source == NULL)
+		return;
+	GList *temp = source->media;
+	while(temp != NULL) {
+		janus_streaming_rtp_source_stream *stream = temp->data;
+		if(stream != NULL && stream->type == JANUS_STREAMING_MEDIA_VIDEO)
+			g_atomic_int_set(&stream->need_pli, 1);
+		temp = temp->next;
+	}
+}
+
+static void janus_streaming_helper_queue_packet(janus_streaming_helper *helper,
+		janus_streaming_rtp_relay_packet *packet) {
+	if(helper == NULL || packet == NULL)
+		return;
+	gboolean enqueued = FALSE, video_dropped = FALSE, warn = FALSE;
+	guint queue_packets = 0;
+	guint64 queue_bytes = 0, dropped_packets = 0, dropped_bytes = 0;
+	gint global_bytes = 0;
+	gint64 now = janus_get_monotonic_time();
+	g_async_queue_lock(helper->queued_packets);
+	if(!g_atomic_int_get(&helper->destroyed) &&
+			!g_atomic_int_get(&helper->mp->destroyed)) {
+		janus_streaming_rtp_relay_packet *oldest =
+			janus_streaming_helper_peek_unlocked(helper);
+		while(janus_streaming_queue_limit_reached(&helper_queue_limits,
+				helper->queue_packets, helper->queue_bytes,
+				oldest == NULL || oldest == &exit_packet ? 0 : oldest->queued_at,
+				packet->queued_bytes, now)) {
+			if(helper->queue_packets >= helper_queue_limits.max_packets)
+				helper->packet_limit_hits++;
+			if(!janus_streaming_queue_bytes_fit(helper_queue_limits.max_bytes,
+					helper->queue_bytes, packet->queued_bytes))
+				helper->byte_limit_hits++;
+			if(oldest != NULL && oldest != &exit_packet && now >= oldest->queued_at &&
+					now - oldest->queued_at >= helper_queue_limits.max_age_us)
+				helper->age_limit_hits++;
+			if(!janus_streaming_helper_drop_oldest_unlocked(helper, &video_dropped))
+				break;
+			oldest = janus_streaming_helper_peek_unlocked(helper);
+		}
+		if(!janus_streaming_queue_limit_reached(&helper_queue_limits,
+				helper->queue_packets, helper->queue_bytes,
+				oldest == NULL || oldest == &exit_packet ? 0 : oldest->queued_at,
+				packet->queued_bytes, now)) {
+			gboolean reserved = janus_streaming_queue_budget_reserve(
+				&helper_queue_global_budget, packet->queued_bytes);
+			while(!reserved) {
+				helper->global_limit_hits++;
+				if(!janus_streaming_helper_drop_oldest_unlocked(helper, &video_dropped))
+					break;
+				reserved = janus_streaming_queue_budget_reserve(
+					&helper_queue_global_budget, packet->queued_bytes);
+			}
+			if(reserved) {
+				/* A successful reservation is the only path that marks a packet accounted. */
+				packet->helper_queued = TRUE;
+				packet->queued_at = now;
+				helper->queue_packets++;
+				helper->queue_bytes += packet->queued_bytes;
+				if(helper->queue_packets > helper->peak_queue_packets)
+					helper->peak_queue_packets = helper->queue_packets;
+				if(helper->queue_bytes > helper->peak_queue_bytes)
+					helper->peak_queue_bytes = helper->queue_bytes;
+				g_async_queue_push_unlocked(helper->queued_packets, packet);
+				enqueued = TRUE;
+			}
+		}
+	}
+	if(!enqueued)
+		janus_streaming_helper_record_drop_unlocked(helper, packet, &video_dropped);
+	if(helper->queue_pressure && (helper->queue_last_warning == 0 ||
+			now - helper->queue_last_warning >= JANUS_STREAMING_HELPER_QUEUE_LOG_INTERVAL_US)) {
+		helper->queue_last_warning = now;
+		warn = TRUE;
+		queue_packets = helper->queue_packets;
+		queue_bytes = helper->queue_bytes;
+		dropped_packets = helper->dropped_packets;
+		dropped_bytes = helper->dropped_bytes;
+		global_bytes = janus_streaming_queue_budget_current(&helper_queue_global_budget);
+	}
+	g_async_queue_unlock(helper->queued_packets);
+	if(!enqueued)
+		janus_streaming_rtp_relay_packet_free(packet);
+	if(video_dropped)
+		janus_streaming_helper_schedule_keyframe(helper);
+	if(warn) {
+		JANUS_LOG(LOG_WARN, "[%s/#%u] Helper queue pressure: %u packets/%"SCNu64
+			" bytes queued, dropped %"SCNu64" packets/%"SCNu64
+			" bytes, global queue %d/%d bytes\n",
+			helper->mp->name, helper->id, queue_packets, queue_bytes,
+			dropped_packets, dropped_bytes, global_bytes, helper_queue_global_budget.max_bytes);
+	}
+}
+
+static janus_streaming_rtp_relay_packet *janus_streaming_helper_pop_packet(
+		janus_streaming_helper *helper) {
+	gboolean recovered = FALSE, video_dropped = FALSE, warn = FALSE;
+	guint queue_packets = 0;
+	guint64 queue_bytes = 0, dropped_packets = 0, dropped_bytes = 0;
+	gint global_bytes = 0;
+	g_async_queue_lock(helper->queued_packets);
+	janus_streaming_rtp_relay_packet *packet = NULL;
+	gint64 now = janus_get_monotonic_time();
+	while(TRUE) {
+		packet = g_async_queue_pop_unlocked(helper->queued_packets);
+		if(packet == &exit_packet)
+			break;
+		janus_streaming_helper_release_packet_unlocked(helper, packet);
+		if(packet->queued_at <= 0 || now < packet->queued_at ||
+				now - packet->queued_at < helper_queue_limits.max_age_us)
+			break;
+		janus_streaming_helper_record_drop_unlocked(helper, packet, &video_dropped);
+		helper->dropped_oldest_packets++;
+		janus_streaming_rtp_relay_packet_free(packet);
+		packet = NULL;
+		now = janus_get_monotonic_time();
+	}
+	if(helper->queue_pressure && (helper->queue_last_warning == 0 ||
+			now - helper->queue_last_warning >= JANUS_STREAMING_HELPER_QUEUE_LOG_INTERVAL_US)) {
+		helper->queue_last_warning = now;
+		warn = TRUE;
+		queue_packets = helper->queue_packets;
+		queue_bytes = helper->queue_bytes;
+		dropped_packets = helper->dropped_packets;
+		dropped_bytes = helper->dropped_bytes;
+		global_bytes = janus_streaming_queue_budget_current(&helper_queue_global_budget);
+	}
+	if(helper->queue_pressure &&
+			helper->queue_packets <= helper_queue_limits.max_packets / 2 &&
+			helper->queue_bytes <= helper_queue_limits.max_bytes / 2) {
+		helper->queue_pressure = FALSE;
+		recovered = TRUE;
+	}
+	g_async_queue_unlock(helper->queued_packets);
+	if(video_dropped)
+		janus_streaming_helper_schedule_keyframe(helper);
+	if(warn) {
+		JANUS_LOG(LOG_WARN, "[%s/#%u] Helper queue pressure: %u packets/%"SCNu64
+			" bytes queued, dropped %"SCNu64" packets/%"SCNu64
+			" bytes, global queue %d/%d bytes\n",
+			helper->mp->name, helper->id, queue_packets, queue_bytes,
+			dropped_packets, dropped_bytes, global_bytes, helper_queue_global_budget.max_bytes);
+	}
+	if(recovered) {
+		JANUS_LOG(LOG_INFO, "[%s/#%u] Helper queue recovered below half of its limits\n",
+			helper->mp->name, helper->id);
+	}
+	return packet;
+}
+
+static void janus_streaming_helper_stop(janus_streaming_helper *helper) {
+	if(helper == NULL)
+		return;
+	gboolean video_dropped = FALSE;
+	g_async_queue_lock(helper->queued_packets);
+	while(janus_streaming_helper_drop_oldest_unlocked(helper, &video_dropped)) {
+	}
+	g_async_queue_push_front_unlocked(helper->queued_packets, &exit_packet);
+	g_async_queue_unlock(helper->queued_packets);
+}
+
+static json_t *janus_streaming_helper_queue_info(janus_streaming_mountpoint *mp,
+		gboolean detailed) {
+	json_t *info = json_object();
+	json_object_set_new(info, "max_packets_per_helper", json_integer(helper_queue_limits.max_packets));
+	json_object_set_new(info, "max_bytes_per_helper", json_integer(helper_queue_limits.max_bytes));
+	json_object_set_new(info, "max_age_ms",
+		json_integer(helper_queue_limits.max_age_us / G_TIME_SPAN_MILLISECOND));
+	json_object_set_new(info, "global_max_bytes", json_integer(helper_queue_global_budget.max_bytes));
+	json_object_set_new(info, "global_current_bytes",
+		json_integer(janus_streaming_queue_budget_current(&helper_queue_global_budget)));
+	json_object_set_new(info, "global_peak_bytes",
+		json_integer(janus_streaming_queue_budget_peak(&helper_queue_global_budget)));
+	guint64 current_packets = 0, current_bytes = 0;
+	guint64 peak_packets = 0, peak_bytes = 0;
+	guint64 dropped_packets = 0, dropped_bytes = 0;
+	guint64 packet_limit_hits = 0, byte_limit_hits = 0, age_limit_hits = 0, global_limit_hits = 0;
+	gint64 oldest_age_ms = 0;
+	json_t *helpers = detailed ? json_array() : NULL;
+	gint64 now = janus_get_monotonic_time();
+	GList *temp = mp->threads;
+	while(temp != NULL) {
+		janus_streaming_helper *helper = temp->data;
+		guint helper_packets, helper_peak_packets;
+		guint64 helper_bytes, helper_peak_bytes, helper_dropped_packets, helper_dropped_bytes;
+		guint64 helper_dropped_oldest_packets;
+		guint64 helper_packet_limit_hits, helper_byte_limit_hits;
+		guint64 helper_age_limit_hits, helper_global_limit_hits;
+		gint64 helper_oldest_age_ms = 0;
+		g_async_queue_lock(helper->queued_packets);
+		helper_packets = helper->queue_packets;
+		helper_bytes = helper->queue_bytes;
+		helper_peak_packets = helper->peak_queue_packets;
+		helper_peak_bytes = helper->peak_queue_bytes;
+		helper_dropped_packets = helper->dropped_packets;
+		helper_dropped_bytes = helper->dropped_bytes;
+		helper_dropped_oldest_packets = helper->dropped_oldest_packets;
+		helper_packet_limit_hits = helper->packet_limit_hits;
+		helper_byte_limit_hits = helper->byte_limit_hits;
+		helper_age_limit_hits = helper->age_limit_hits;
+		helper_global_limit_hits = helper->global_limit_hits;
+		janus_streaming_rtp_relay_packet *oldest = janus_streaming_helper_peek_unlocked(helper);
+		if(oldest != NULL && oldest != &exit_packet && now >= oldest->queued_at)
+			helper_oldest_age_ms = (now - oldest->queued_at) / G_TIME_SPAN_MILLISECOND;
+		g_async_queue_unlock(helper->queued_packets);
+		current_packets += helper_packets;
+		current_bytes += helper_bytes;
+		peak_packets += helper_peak_packets;
+		peak_bytes += helper_peak_bytes;
+		dropped_packets += helper_dropped_packets;
+		dropped_bytes += helper_dropped_bytes;
+		packet_limit_hits += helper_packet_limit_hits;
+		byte_limit_hits += helper_byte_limit_hits;
+		age_limit_hits += helper_age_limit_hits;
+		global_limit_hits += helper_global_limit_hits;
+		if(helper_oldest_age_ms > oldest_age_ms)
+			oldest_age_ms = helper_oldest_age_ms;
+		if(detailed) {
+			json_t *entry = json_object();
+			json_object_set_new(entry, "id", json_integer(helper->id));
+			json_object_set_new(entry, "current_packets", json_integer(helper_packets));
+			json_object_set_new(entry, "current_bytes", json_integer(helper_bytes));
+			json_object_set_new(entry, "peak_packets", json_integer(helper_peak_packets));
+			json_object_set_new(entry, "peak_bytes", json_integer(helper_peak_bytes));
+			json_object_set_new(entry, "dropped_packets", json_integer(helper_dropped_packets));
+			json_object_set_new(entry, "dropped_bytes", json_integer(helper_dropped_bytes));
+			json_object_set_new(entry, "dropped_oldest_packets",
+				json_integer(helper_dropped_oldest_packets));
+			json_object_set_new(entry, "oldest_age_ms", json_integer(helper_oldest_age_ms));
+			json_object_set_new(entry, "packet_limit_hits", json_integer(helper_packet_limit_hits));
+			json_object_set_new(entry, "byte_limit_hits", json_integer(helper_byte_limit_hits));
+			json_object_set_new(entry, "age_limit_hits", json_integer(helper_age_limit_hits));
+			json_object_set_new(entry, "global_limit_hits", json_integer(helper_global_limit_hits));
+			json_array_append_new(helpers, entry);
+		}
+		temp = temp->next;
+	}
+	json_object_set_new(info, "current_packets", json_integer(current_packets));
+	json_object_set_new(info, "current_bytes", json_integer(current_bytes));
+	json_object_set_new(info, "sum_peak_packets", json_integer(peak_packets));
+	json_object_set_new(info, "sum_peak_bytes", json_integer(peak_bytes));
+	json_object_set_new(info, "dropped_packets", json_integer(dropped_packets));
+	json_object_set_new(info, "dropped_bytes", json_integer(dropped_bytes));
+	json_object_set_new(info, "oldest_age_ms", json_integer(oldest_age_ms));
+	json_object_set_new(info, "packet_limit_hits", json_integer(packet_limit_hits));
+	json_object_set_new(info, "byte_limit_hits", json_integer(byte_limit_hits));
+	json_object_set_new(info, "age_limit_hits", json_integer(age_limit_hits));
+	json_object_set_new(info, "global_limit_hits", json_integer(global_limit_hits));
+	if(detailed)
+		json_object_set_new(info, "helpers", helpers);
+	return info;
+}
 
 
 
@@ -1772,7 +2117,7 @@ static void janus_streaming_mountpoint_destroy(janus_streaming_mountpoint *mount
 		GList *l = mountpoint->threads;
 		while(l) {
 			janus_streaming_helper *ht = (janus_streaming_helper *)l->data;
-			g_async_queue_push(ht->queued_packets, &exit_packet);
+			janus_streaming_helper_stop(ht);
 			janus_streaming_helper_destroy(ht);
 			l = l->next;
 		}
@@ -2225,6 +2570,23 @@ static char *janus_streaming_parse_sprop(char *sprop, int *len) {
 #define JANUS_STREAMING_ERROR_INVALID_SDP			461
 #define JANUS_STREAMING_ERROR_UNKNOWN_ERROR			470
 
+static guint64 janus_streaming_parse_helper_queue_limit(janus_config_category *general,
+		const char *name, guint64 fallback, guint64 maximum) {
+	janus_config_item *item = janus_config_get(config, general, janus_config_type_item, name);
+	if(item == NULL || item->value == NULL)
+		return fallback;
+	errno = 0;
+	char *end = NULL;
+	guint64 parsed = g_ascii_strtoull(item->value, &end, 10);
+	if(errno != 0 || item->value[0] == '-' || end == item->value || *end != '\0' ||
+			parsed == 0 || parsed > maximum) {
+		JANUS_LOG(LOG_WARN, "Invalid Streaming helper queue setting '%s', using default %"SCNu64"\n",
+			name, fallback);
+		return fallback;
+	}
+	return parsed;
+}
+
 
 /* Plugin implementation */
 int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
@@ -2244,6 +2606,12 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 		/* Invalid arguments */
 		return -1;
 	}
+	helper_queue_limits.max_packets = JANUS_STREAMING_HELPER_QUEUE_MAX_PACKETS;
+	helper_queue_limits.max_bytes = JANUS_STREAMING_HELPER_QUEUE_MAX_BYTES;
+	helper_queue_limits.max_age_us = JANUS_STREAMING_HELPER_QUEUE_MAX_AGE_MS * G_TIME_SPAN_MILLISECOND;
+	helper_queue_global_budget.max_bytes = JANUS_STREAMING_HELPER_QUEUE_GLOBAL_MAX_BYTES;
+	if(janus_streaming_queue_budget_current(&helper_queue_global_budget) == 0)
+		g_atomic_int_set(&helper_queue_global_budget.peak_bytes, 0);
 
 	struct ifaddrs *ifas = NULL;
 	if(getifaddrs(&ifas) == -1) {
@@ -2287,6 +2655,25 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 	/* Parse configuration to populate the mountpoints */
 	if(config != NULL) {
 		janus_config_category *config_general = janus_config_get_create(config, NULL, janus_config_type_category, "general");
+		helper_queue_limits.max_packets = janus_streaming_parse_helper_queue_limit(config_general,
+			"helper_queue_max_packets", JANUS_STREAMING_HELPER_QUEUE_MAX_PACKETS, G_MAXUINT32);
+		helper_queue_limits.max_bytes = janus_streaming_parse_helper_queue_limit(config_general,
+			"helper_queue_max_bytes", JANUS_STREAMING_HELPER_QUEUE_MAX_BYTES, G_MAXINT);
+		guint64 helper_queue_max_age_ms = janus_streaming_parse_helper_queue_limit(config_general,
+			"helper_queue_max_age_ms", JANUS_STREAMING_HELPER_QUEUE_MAX_AGE_MS, G_MAXINT);
+		helper_queue_limits.max_age_us = helper_queue_max_age_ms * G_TIME_SPAN_MILLISECOND;
+		helper_queue_global_budget.max_bytes = janus_streaming_parse_helper_queue_limit(config_general,
+			"helper_queue_global_max_bytes", JANUS_STREAMING_HELPER_QUEUE_GLOBAL_MAX_BYTES, G_MAXINT);
+		if(helper_queue_limits.max_bytes > (guint64)helper_queue_global_budget.max_bytes) {
+			JANUS_LOG(LOG_WARN, "Streaming helper per-queue byte limit exceeds the global limit, clamping it to %d\n",
+				helper_queue_global_budget.max_bytes);
+			helper_queue_limits.max_bytes = helper_queue_global_budget.max_bytes;
+		}
+		JANUS_LOG(LOG_INFO, "Streaming helper queue limits: %u packets, %"SCNu64
+			" bytes and %"SCNu64" ms per helper; %d bytes globally\n",
+			helper_queue_limits.max_packets, helper_queue_limits.max_bytes,
+			helper_queue_limits.max_age_us / G_TIME_SPAN_MILLISECOND,
+			helper_queue_global_budget.max_bytes);
 		/* Any admin key to limit who can "create"? */
 		janus_config_item *key = janus_config_get(config, config_general, janus_config_type_item, "admin_key");
 		if(key != NULL && key->value != NULL)
@@ -3467,6 +3854,11 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 			json_object_set_new(ml, "enabled", mp->enabled ? json_true() : json_false());
 			if(mp->streaming_source == janus_streaming_source_rtp) {
 				janus_streaming_rtp_source *source = mp->source;
+				if(mp->helper_threads > 0) {
+					json_object_set_new(ml, "threads", json_integer(mp->helper_threads));
+					json_object_set_new(ml, "helper_queue",
+						janus_streaming_helper_queue_info(mp, FALSE));
+				}
 #ifdef HAVE_LIBCURL
 				if(source->rtsp)
 					json_object_set_new(ml, "rtsp_no_media_count",
@@ -3637,8 +4029,11 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 			if(source->bufferkf_bytes > 0) {
 				json_object_set_new(ml, "bufferkf_bytes", json_integer(source->bufferkf_bytes));
 			}
-			if(mp->helper_threads > 0)
+			if(mp->helper_threads > 0) {
 				json_object_set_new(ml, "threads", json_integer(mp->helper_threads));
+				json_object_set_new(ml, "helper_queue",
+					janus_streaming_helper_queue_info(mp, TRUE));
+			}
 			/* Iterate on media now */
 			GList *temp = source->media;
 			while(temp) {
@@ -11672,7 +12067,8 @@ static void janus_streaming_helper_rtprtcp_packet(gpointer data, gpointer user_d
 	copy->ptype = packet->ptype;
 	copy->timestamp = packet->timestamp;
 	copy->seq_number = packet->seq_number;
-	g_async_queue_push(helper->queued_packets, copy);
+	copy->queued_bytes = sizeof(*copy) + copy->length;
+	janus_streaming_helper_queue_packet(helper, copy);
 }
 
 static void *janus_streaming_helper_thread(void *data) {
@@ -11681,7 +12077,7 @@ static void *janus_streaming_helper_thread(void *data) {
 	JANUS_LOG(LOG_INFO, "[%s/#%d] Joining Streaming helper thread\n", mp->name, helper->id);
 	janus_streaming_rtp_relay_packet *pkt = NULL;
 	while(!g_atomic_int_get(&stopping) && !g_atomic_int_get(&mp->destroyed) && !g_atomic_int_get(&helper->destroyed)) {
-		pkt = g_async_queue_pop(helper->queued_packets);
+		pkt = janus_streaming_helper_pop_packet(helper);
 		if(pkt == &exit_packet)
 			break;
 		janus_mutex_lock(&helper->mutex);

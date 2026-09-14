@@ -458,6 +458,8 @@ if ENABLE_PLUGIN_STREAMING
 plugin_LTLIBRARIES += plugins/libjanus_streaming.la
 plugins_libjanus_streaming_la_SOURCES = \
 	plugins/janus_streaming.c \
+	plugins/janus_streaming_queue_limits.c \
+	plugins/janus_streaming_queue_limits.h \
 	plugins/janus_streaming_rtsp_io.c \
 	plugins/janus_streaming_rtsp_io.h
 plugins_libjanus_streaming_la_CFLAGS = $(plugins_cflags) $(LIBCURL_CFLAGS) $(OGG_CFLAGS) $(LIBSRTP_CFLAGS)

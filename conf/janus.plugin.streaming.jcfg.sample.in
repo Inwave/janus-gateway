@@ -169,6 +169,13 @@ general: {
 									# passed as port for a mountpoint (default=10000-60000)
 	#events = false					# Whether events should be sent to event
 									# handlers (default=true)
+	# Helper threads decouple RTP/RTSP input from viewer delivery. Their live
+	# queues discard the oldest packets when the first of these limits is hit,
+	# keeping input responsive and memory bounded when delivery is slower.
+	#helper_queue_max_packets = 256		# Packets queued by each helper
+	#helper_queue_max_bytes = 2097152	# Allocated bytes queued by each helper
+	#helper_queue_max_age_ms = 2000		# Maximum live backlog age
+	#helper_queue_global_max_bytes = 67108864	# Total across all mountpoints/helpers
 
 	# By default, integers are used as a unique ID for both mountpoints. In case
 	# you want to use strings instead (e.g., a UUID), set string_ids to true.

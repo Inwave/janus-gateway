@@ -88,7 +88,10 @@ handoff. The test proves that this creates backpressure in each ICE handle while
 RTSP draining and per-viewer throughput remain equivalent for all three helper
 counts. It then delays the plugin-to-core relay call instead, proving the
 different property helper threads provide: one helper isolates RTSP reception,
-while two helpers let the two viewers progress independently.
+while two helpers let the two viewers progress independently. Under that
+pressure it also verifies that helper queues never exceed configured packet,
+byte, age and global byte bounds, that drops are exposed by the Streaming
+`info` response, and that dropping delayed video schedules a new RTCP PLI.
 
 The test requires the `aiortc` dependency from `test/requirements.txt` and a C
 compiler. After building Janus with the HTTP transport and libcurl, run:
