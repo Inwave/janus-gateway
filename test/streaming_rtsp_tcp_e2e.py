@@ -424,6 +424,9 @@ def run(args):
         environment["JANUS_TEST_FORCE_RTCP_EAGAIN"] = "1"
         trigger_path = root / "enable-rtcp-eagain"
         environment["JANUS_TEST_RTCP_EAGAIN_FILE"] = str(trigger_path)
+        receive_error_path = root / "force-rtsp-receive-error"
+        environment["JANUS_TEST_FORCE_RTSP_RECV_ERROR"] = "1"
+        environment["JANUS_TEST_RTSP_RECV_ERROR_FILE"] = str(receive_error_path)
         with log_path.open("wb") as log_file:
             process = subprocess.Popen(
                 [str(janus), "-F", str(config_dir), "-o"],
@@ -604,6 +607,117 @@ def run(args):
                             "info did not expose the updated RTSP no-media counter: "
                             f"{final_info_count} != {observed_counts[1]}"
                         )
+
+                    # A DVR reset can surface as a real libcurl receive error.
+                    # Janus must reconnect without changing the operator-owned
+                    # enabled state of that mountpoint.
+                    receive_error_path.touch()
+                    receive_error_deadline = time.monotonic() + 2.0
+                    while time.monotonic() < receive_error_deadline:
+                        log_file.flush()
+                        log_text = log_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        if (
+                            "[rtsp-recv-shim]" in log_text
+                            and "RTSP/TCP RECEIVE error" in log_text
+                        ):
+                            break
+                        time.sleep(0.05)
+                    else:
+                        raise AssertionError(
+                            "fault injection did not exercise the RTSP receive-error path"
+                        )
+
+                    after_error = plugin_message(
+                        http_port,
+                        session_id,
+                        handle_id,
+                        {"request": "list"},
+                        timeout=1.0,
+                    )
+                    error_mountpoints = {
+                        mountpoint["id"]: mountpoint
+                        for mountpoint in plugin_result(after_error).get("list", [])
+                    }
+                    if error_mountpoints.get(1, {}).get("enabled") is not True:
+                        raise AssertionError(
+                            "a transient RTSP receive error changed stream1's operator-owned "
+                            f"enabled state: {error_mountpoints}"
+                        )
+                    if not rtsp.wait_for_stream_plays("stream1", 3, 4.0):
+                        raise AssertionError(
+                            "Janus did not reconnect stream1 after the RTSP receive error: "
+                            f"{rtsp.play_counts}"
+                        )
+
+                    deadline = time.monotonic() + 2.0
+                    reset_mountpoints = None
+                    while time.monotonic() < deadline:
+                        after_reset = plugin_message(
+                            http_port,
+                            session_id,
+                            handle_id,
+                            {"request": "list"},
+                            timeout=1.0,
+                        )
+                        reset_mountpoints = {
+                            mountpoint["id"]: mountpoint
+                            for mountpoint in plugin_result(after_reset).get("list", [])
+                        }
+                        stream1_media = reset_mountpoints.get(1, {}).get("media", [])
+                        stream1_ages = [
+                            media["age_ms"]
+                            for media in stream1_media
+                            if "age_ms" in media
+                        ]
+                        if (
+                            reset_mountpoints.get(1, {}).get("enabled") is True
+                            and reset_mountpoints.get(1, {}).get(
+                                "rtsp_no_media_count"
+                            )
+                            == observed_counts[1] + 1
+                            and stream1_ages
+                            and max(stream1_ages) < 500
+                        ):
+                            break
+                        time.sleep(0.05)
+                    else:
+                        raise AssertionError(
+                            "stream1 reconnected and received fresh RTP but did not remain "
+                            f"enabled after the RTSP receive error: {reset_mountpoints}"
+                        )
+                    if reset_mountpoints.get(2, {}).get("enabled") is not True:
+                        raise AssertionError(
+                            "the independent stream2 mountpoint was disabled by stream1's "
+                            f"RTSP receive error: {reset_mountpoints}"
+                        )
+                    if (
+                        reset_mountpoints.get(2, {}).get("rtsp_no_media_count")
+                        != observed_counts[2]
+                    ):
+                        raise AssertionError(
+                            "stream2's no-media counter changed during stream1's error: "
+                            f"{reset_mountpoints}"
+                        )
+                    if rtsp.play_counts.get("stream2") != 1:
+                        raise AssertionError(
+                            "stream2 reconnected unexpectedly during stream1's error: "
+                            f"{rtsp.play_counts}"
+                        )
+
+                    reset_info = plugin_message(
+                        http_port,
+                        session_id,
+                        handle_id,
+                        {"request": "info", "id": 1},
+                        timeout=1.0,
+                    )
+                    if plugin_result(reset_info).get("info", {}).get("enabled") is not True:
+                        raise AssertionError(
+                            "info reported stream1 disabled after RTSP recovery: "
+                            f"{reset_info}"
+                        )
                 else:
                     if switch_result is not None:
                         raise AssertionError("vulnerable plugin unexpectedly completed switch")
@@ -659,7 +773,10 @@ def run(args):
             raise AssertionError("vulnerable shutdown did not reach the expected wait point")
         verified = "switch/list/attach/shutdown"
         if args.expect == "fixed":
-            verified = "switch/list/attach/keepalive/media/no-media-counter/shutdown"
+            verified = (
+                "switch/list/attach/keepalive/media/no-media-counter/"
+                "receive-reset/shutdown"
+            )
         print(f"RTSP/TCP E2E {args.expect}: {verified} behavior verified")
 
 

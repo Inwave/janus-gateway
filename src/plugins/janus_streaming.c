@@ -10944,11 +10944,16 @@ static void *janus_streaming_relay_thread(void *data) {
 						temp = temp->next;
 					}
 				} else {
-					/* erro real → acione reconexão */
+					/* A transport error must not change the operator-owned enabled
+					 * state. Stop reading this session and let the existing delayed
+					 * reconnect path establish a fresh RTSP connection. */
 					JANUS_LOG(LOG_WARN, "[%s] RTSP/TCP RECEIVE error: %s\n",
 							mountpoint->name, curl_easy_strerror(rc));
 
-					mountpoint->enabled = FALSE;
+					connected = FALSE;
+					source->played = FALSE;
+					source->reconnect_timer = janus_get_monotonic_time();
+					source->reconnect_at = 0;
 					janus_mutex_lock(&source->rec_mutex);
 					GList *temp = source->media;
 					while(temp) {

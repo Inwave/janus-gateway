@@ -59,10 +59,13 @@ plugin tries to send interleaved RTCP. The test verifies that `switch`, `list`, 
 new session/attach and graceful shutdown remain bounded. It also uses a short
 RTSP session timeout to prove that periodic keepalive `OPTIONS` requests are
 sent without a burst, the easy handle returns to `RECEIVE`, media remains fresh
-and no reconnect is triggered. Finally, it pauses media on only one fake camera
-and verifies that `rtsp_no_media_count` increments only for that mountpoint and
-has the same value in the Streaming `list` and `info` responses. The counter is
-cumulative for the lifetime of the RTSP mountpoint.
+and no reconnect is triggered. It then pauses media on only one fake camera and
+verifies that `rtsp_no_media_count` increments only for that mountpoint and has
+the same value in the Streaming `list` and `info` responses. Finally, the shim
+forces a real libcurl receive error on that source and verifies that the source
+reconnects, media becomes fresh, the counter advances only once and the
+operator-owned `enabled` state remains true. The counter is cumulative for the
+lifetime of the RTSP mountpoint.
 
 After building Janus, run the fixed-code regression with:
 
