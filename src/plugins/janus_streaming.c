@@ -1853,6 +1853,29 @@ static void janus_streaming_notify_subscribers(janus_streaming_mountpoint *mount
 	}
 }
 
+#ifdef HAVE_LIBCURL
+static void janus_streaming_rtsp_notify_disconnected(janus_streaming_mountpoint *mountpoint,
+		janus_streaming_rtp_source *source) {
+	if(mountpoint == NULL || source == NULL)
+		return;
+	if(notify_events && gateway->events_is_enabled()) {
+		json_t *info = json_object();
+		json_object_set_new(info, "event", json_string("rtsp-disconnected"));
+		json_object_set_new(info, "id", string_ids ? json_string(mountpoint->id_str) : json_integer(mountpoint->id));
+		gateway->notify_event(&janus_streaming_plugin, NULL, info);
+	}
+	if(source->rtsp_notify_changes) {
+		json_t *info = json_object();
+		json_object_set_new(info, "event", json_string("rtsp-disconnected"));
+		json_object_set_new(info, "id", string_ids ? json_string(mountpoint->id_str) : json_integer(mountpoint->id));
+		janus_mutex_lock(&mountpoint->mutex);
+		janus_streaming_notify_subscribers(mountpoint, info);
+		janus_mutex_unlock(&mountpoint->mutex);
+		json_decref(info);
+	}
+}
+#endif
+
 #ifdef HAVE_LIBOGG
 /* Helper struct to handle the playout of Opus files */
 typedef struct janus_streaming_opus_context {
@@ -10757,7 +10780,7 @@ static void *janus_streaming_relay_thread(void *data) {
 		source->reconnect_at = 0;
 		ka_timeout = source->ka_timeout;
 	}
-    gboolean connected = TRUE;
+	gboolean connected = !source->rtsp || source->played;
 #endif
 	/* Loop */
 	while(!g_atomic_int_get(&stopping) && !g_atomic_int_get(&mountpoint->destroyed)) {
@@ -10788,29 +10811,13 @@ static void *janus_streaming_relay_thread(void *data) {
 				source->reconnect_at = 0;
 				janus_streaming_rtsp_close(source, name, TRUE); 
 				source->reconnect_timer = now;
+				if(connected)
+					janus_streaming_rtsp_notify_disconnected(mountpoint, source);
 				connected = FALSE;
 				source->reconnecting = TRUE;
 				source->played = FALSE;
 				if(g_atomic_int_get(&mountpoint->destroyed))
 					break;
-				if(connected) {
-					/* Notify users and/or event handlers about this disconnection */
-					if(notify_events && gateway->events_is_enabled()) {
-						json_t *info = json_object();
-						json_object_set_new(info, "event", json_string("rtsp-disconnected"));
-						json_object_set_new(info, "id", string_ids ? json_string(mountpoint->id_str) : json_integer(mountpoint->id));
-						gateway->notify_event(&janus_streaming_plugin, NULL, info);
-					}
-					if(source->rtsp_notify_changes) {
-						json_t *info = json_object();
-						json_object_set_new(info, "event", json_string("rtsp-disconnected"));
-						json_object_set_new(info, "id", string_ids ? json_string(mountpoint->id_str) : json_integer(mountpoint->id));
-						janus_mutex_lock(&mountpoint->mutex);
-						janus_streaming_notify_subscribers(mountpoint, info);
-						janus_mutex_unlock(&mountpoint->mutex);
-						json_decref(info);
-					}
-				}
 				/* Now let's try to reconnect */
 				source->reconnect_timer = now;
 				connected = FALSE;
@@ -10950,6 +10957,8 @@ static void *janus_streaming_relay_thread(void *data) {
 					JANUS_LOG(LOG_WARN, "[%s] RTSP/TCP RECEIVE error: %s\n",
 							mountpoint->name, curl_easy_strerror(rc));
 
+					if(connected)
+						janus_streaming_rtsp_notify_disconnected(mountpoint, source);
 					connected = FALSE;
 					source->played = FALSE;
 					source->reconnect_timer = janus_get_monotonic_time();

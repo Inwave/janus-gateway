@@ -64,8 +64,10 @@ verifies that `rtsp_no_media_count` increments only for that mountpoint and has
 the same value in the Streaming `list` and `info` responses. Finally, the shim
 forces a real libcurl receive error on that source and verifies that the source
 reconnects, media becomes fresh, the counter advances only once and the
-operator-owned `enabled` state remains true. The counter is cumulative for the
-lifetime of the RTSP mountpoint.
+operator-owned `enabled` state remains true. With `rtsp_notify_changes` enabled,
+both recovery paths must also notify the affected subscriber with
+`rtsp-disconnected` followed by `rtsp-reconnected`. The counter is cumulative
+for the lifetime of the RTSP mountpoint.
 
 After building Janus, run the fixed-code regression with:
 

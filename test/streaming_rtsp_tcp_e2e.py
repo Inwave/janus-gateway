@@ -303,6 +303,24 @@ def wait_for_plugin_result(port, session_id, key, timeout):
     return None
 
 
+def wait_for_rtsp_events(port, session_id, expected, timeout):
+    observed = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            events = get_events(port, session_id, min(0.6, deadline - time.monotonic()))
+        except (TimeoutError, socket.timeout):
+            continue
+        for event in events:
+            change = event.get("plugindata", {}).get("data", {}).get("event")
+            if change not in ("rtsp-disconnected", "rtsp-reconnected"):
+                continue
+            observed.append(change)
+            if observed[-len(expected) :] == expected:
+                return observed
+    return observed
+
+
 def wait_for_api(port, process, timeout=8.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -375,6 +393,7 @@ def write_configs(root, plugin_library, transport_library, http_port, rtsp_port)
             "  rtsp_reconnect_delay = 1\n"
             "  rtsp_timeout = 1\n"
             "  rtsp_conn_timeout = 1\n"
+            f"  rtsp_notify_changes = {'true' if number == 1 else 'false'}\n"
             "  threads = 0\n"
             "}\n"
         )
@@ -477,7 +496,27 @@ def run(args):
                     if listed.get("janus") != "success":
                         raise AssertionError(f"list failed after switch: {listed}")
                     second_session = create_session(http_port, timeout=1.0)
-                    attach_streaming(http_port, second_session, timeout=1.0)
+                    second_handle = attach_streaming(
+                        http_port, second_session, timeout=1.0
+                    )
+                    second_watch = plugin_message(
+                        http_port,
+                        second_session,
+                        second_handle,
+                        {"request": "watch", "id": 1},
+                        timeout=1.0,
+                    )
+                    if second_watch.get("janus") != "ack":
+                        raise AssertionError(
+                            f"stream1 observer was not acknowledged: {second_watch}"
+                        )
+                    if (
+                        wait_for_plugin_result(
+                            http_port, second_session, "status", 3.0
+                        )
+                        is None
+                    ):
+                        raise AssertionError("stream1 observer event was not delivered")
                     create_session(http_port, timeout=1.0)
                     deadline = time.monotonic() + 3.0
                     while time.monotonic() < deadline:
@@ -558,6 +597,20 @@ def run(args):
                             f"{rtsp.play_counts}"
                         )
                     rtsp.pause_stream("stream1", False)
+                    no_media_events = wait_for_rtsp_events(
+                        http_port,
+                        second_session,
+                        ["rtsp-disconnected", "rtsp-reconnected"],
+                        2.0,
+                    )
+                    if no_media_events[-2:] != [
+                        "rtsp-disconnected",
+                        "rtsp-reconnected",
+                    ]:
+                        raise AssertionError(
+                            "no-media recovery did not notify disconnect/reconnect in order: "
+                            f"{no_media_events}"
+                        )
 
                     deadline = time.monotonic() + 2.0
                     observed_counts = None
@@ -649,6 +702,20 @@ def run(args):
                         raise AssertionError(
                             "Janus did not reconnect stream1 after the RTSP receive error: "
                             f"{rtsp.play_counts}"
+                        )
+                    receive_error_events = wait_for_rtsp_events(
+                        http_port,
+                        second_session,
+                        ["rtsp-disconnected", "rtsp-reconnected"],
+                        2.0,
+                    )
+                    if receive_error_events[-2:] != [
+                        "rtsp-disconnected",
+                        "rtsp-reconnected",
+                    ]:
+                        raise AssertionError(
+                            "receive-error recovery did not notify disconnect/reconnect in "
+                            f"order: {receive_error_events}"
                         )
 
                     deadline = time.monotonic() + 2.0
@@ -775,7 +842,7 @@ def run(args):
         if args.expect == "fixed":
             verified = (
                 "switch/list/attach/keepalive/media/no-media-counter/"
-                "receive-reset/shutdown"
+                "receive-reset/notifications/shutdown"
             )
         print(f"RTSP/TCP E2E {args.expect}: {verified} behavior verified")
 
