@@ -39,6 +39,9 @@ class RtspServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         super().__init__(("127.0.0.1", 0), RtspHandler)
         self.play_count = 0
         self.play_condition = threading.Condition()
+        self.keepalive_counts = {}
+        self.keepalive_condition = threading.Condition()
+        self.options_burst = threading.Event()
 
     def played(self):
         with self.play_condition:
@@ -55,6 +58,23 @@ class RtspServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 self.play_condition.wait(remaining)
             return True
 
+    def kept_alive(self, session_id):
+        with self.keepalive_condition:
+            self.keepalive_counts[session_id] = self.keepalive_counts.get(session_id, 0) + 1
+            self.keepalive_condition.notify_all()
+
+    def wait_for_keepalives(self, connections, per_connection, timeout):
+        deadline = time.monotonic() + timeout
+        with self.keepalive_condition:
+            while True:
+                counts = sorted(self.keepalive_counts.values(), reverse=True)
+                if len(counts) >= connections and min(counts[:connections]) >= per_connection:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.keepalive_condition.wait(remaining)
+
 
 class RtspHandler(socketserver.BaseRequestHandler):
     def handle(self):
@@ -65,6 +85,7 @@ class RtspHandler(socketserver.BaseRequestHandler):
         timestamp = 0
         next_packet = time.monotonic()
         session_id = f"local-{self.request.fileno()}"
+        recent_options = []
         while True:
             if playing and time.monotonic() >= next_packet:
                 rtp = struct.pack("!BBHII", 0x80, 96, sequence, timestamp, 1) + b"\x65\x00"
@@ -108,9 +129,17 @@ class RtspHandler(socketserver.BaseRequestHandler):
                         key, value = line.split(":", 1)
                         headers[key.lower()] = value.strip()
                 cseq = headers.get("cseq", "1")
-                response_headers = [f"CSeq: {cseq}", f"Session: {session_id};timeout=60"]
+                response_headers = [f"CSeq: {cseq}", f"Session: {session_id};timeout=2"]
                 body = b""
                 if method == "OPTIONS":
+                    if playing:
+                        self.server.kept_alive(session_id)
+                        now = time.monotonic()
+                        recent_options = [stamp for stamp in recent_options if now - stamp < 0.2]
+                        recent_options.append(now)
+                        if len(recent_options) >= 3:
+                            self.server.options_burst.set()
+                            playing = False
                     response_headers.append("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN")
                 elif method == "DESCRIBE":
                     body = SDP
@@ -413,6 +442,43 @@ def run(args):
                         time.sleep(0.05)
                     else:
                         raise AssertionError("RTCP fault injection was not exercised")
+                    if not rtsp.wait_for_keepalives(2, 2, 3.0):
+                        raise AssertionError(
+                            f"RTSP keepalive cycles were not sent: {rtsp.keepalive_counts}"
+                        )
+                    if rtsp.options_burst.wait(0.3):
+                        if not rtsp.wait_for_plays(3, 3.0):
+                            raise AssertionError(
+                                "RTSP OPTIONS burst stopped media without reconnecting"
+                            )
+                        raise AssertionError(
+                            "RTSP keepalive left the handle in OPTIONS mode "
+                            "and triggered a reconnect"
+                        )
+                    continuity = plugin_message(
+                        http_port,
+                        session_id,
+                        handle_id,
+                        {"request": "list"},
+                        timeout=1.0,
+                    )
+                    mountpoints = continuity.get("plugindata", {}).get("data", {}).get(
+                        "list", []
+                    )
+                    ages = [
+                        media["age_ms"]
+                        for mountpoint in mountpoints
+                        for media in mountpoint.get("media", [])
+                        if "age_ms" in media
+                    ]
+                    if len(ages) != 2 or max(ages) > 500:
+                        raise AssertionError(
+                            f"RTSP media was not fresh after keepalive: {ages}"
+                        )
+                    if rtsp.play_count != 2:
+                        raise AssertionError(
+                            f"RTSP sources reconnected unexpectedly: {rtsp.play_count} PLAYs"
+                        )
                 else:
                     if switch_result is not None:
                         raise AssertionError("vulnerable plugin unexpectedly completed switch")
@@ -466,9 +532,10 @@ def run(args):
             raise AssertionError("fault injection marker absent from Janus log")
         if args.expect == "vulnerable" and "Ending requests thread" not in log_text:
             raise AssertionError("vulnerable shutdown did not reach the expected wait point")
-        print(
-            f"RTSP/TCP E2E {args.expect}: switch/list/attach/shutdown behavior verified"
-        )
+        verified = "switch/list/attach/shutdown"
+        if args.expect == "fixed":
+            verified = "switch/list/attach/keepalive/media/shutdown"
+        print(f"RTSP/TCP E2E {args.expect}: {verified} behavior verified")
 
 
 def main():

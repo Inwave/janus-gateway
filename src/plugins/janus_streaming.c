@@ -10788,6 +10788,7 @@ static void *janus_streaming_relay_thread(void *data) {
 						/* Everything should be back to normal */
 						JANUS_LOG(LOG_INFO, "[%s] Reconnected to the RTSP server, streaming again\n", name);
 						ka_timeout = source->ka_timeout;
+						before = janus_get_monotonic_time();
 						connected = TRUE;
 						source->played = TRUE;
 						/* Check if the number of sockets to monitor changed */
@@ -10859,6 +10860,11 @@ static void *janus_streaming_relay_thread(void *data) {
 					if(resfd != CURLE_OK) {
 						JANUS_LOG(LOG_ERR, "[%s] Couldn't send OPTIONS request: %s (%s)\n",
 							name, curl_easy_strerror(resfd), source->curl_errbuf);
+					}
+					if(source->rtsp_tcp) {
+						/* OPTIONS changes the request on the easy handle: switch it back
+						 * before the next iteration so interleaved RTP is drained again. */
+						curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_RECEIVE);
 					}
 					janus_mutex_unlock(&source->rtsp_mutex);
 				//}

@@ -56,7 +56,10 @@ Finally it will check the exit status of the Python script and kill the Janus in
 `streaming_rtsp_tcp_e2e.py` starts two loopback-only fake RTSP cameras and a
 Janus instance. A local `LD_PRELOAD` shim forces `EAGAIN` only when the Streaming
 plugin tries to send interleaved RTCP. The test verifies that `switch`, `list`, a
-new session/attach and graceful shutdown remain bounded.
+new session/attach and graceful shutdown remain bounded. It also uses a short
+RTSP session timeout to prove that periodic keepalive `OPTIONS` requests are
+sent without a burst, the easy handle returns to `RECEIVE`, media remains fresh
+and no reconnect is triggered.
 
 After building Janus, run the fixed-code regression with:
 
