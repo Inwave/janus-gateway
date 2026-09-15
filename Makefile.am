@@ -10,7 +10,8 @@ DISTCHECK_CONFIGURE_FLAGS = --disable-docs --enable-post-processing
 EXTRA_DIST = $(NULL)
 CLEANFILES = $(NULL)
 
-check_PROGRAMS = test/test_streaming_rtsp_io test/test_streaming_queue_limits
+check_PROGRAMS = test/test_streaming_rtsp_io test/test_streaming_queue_limits \
+	test/test_ice_server_cache
 TESTS = $(check_PROGRAMS)
 test_test_streaming_rtsp_io_SOURCES = \
 	test/test_streaming_rtsp_io.c \
@@ -22,6 +23,12 @@ test_test_streaming_queue_limits_SOURCES = \
 	src/plugins/janus_streaming_queue_limits.h
 test_test_streaming_queue_limits_CFLAGS = $(JANUS_CFLAGS)
 test_test_streaming_queue_limits_LDADD = $(JANUS_LIBS)
+test_test_ice_server_cache_SOURCES = \
+	test/test_ice_server_cache.c \
+	src/ice-server-cache.c \
+	src/ice-server-cache.h
+test_test_ice_server_cache_CFLAGS = $(JANUS_CFLAGS)
+test_test_ice_server_cache_LDADD = $(JANUS_LIBS)
 EXTRA_DIST += \
 	test/force_rtcp_eagain.c \
 	test/slow_streaming_path.c \

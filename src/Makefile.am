@@ -81,6 +81,8 @@ janus_SOURCES = \
 	dtls-bio.h \
 	events.c \
 	events.h \
+	ice-server-cache.c \
+	ice-server-cache.h \
 	ice.c \
 	ice.h \
 	janus.c \

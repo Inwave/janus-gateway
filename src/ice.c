@@ -25,6 +25,7 @@
 #include <sys/time.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include <gio/gio.h>
 #include <stun/usages/bind.h>
 #include <nice/debug.h>
 
@@ -38,9 +39,11 @@
 #include "apierror.h"
 #include "ip-utils.h"
 #include "events.h"
+#include "ice-server-cache.h"
 
 /* STUN server/port, if any */
 static char *janus_stun_server = NULL;
+static janus_ice_server_cache janus_stun_server_cache;
 static uint16_t janus_stun_port = 0;
 
 char *janus_ice_get_stun_server(void) {
@@ -53,6 +56,7 @@ uint16_t janus_ice_get_stun_port(void) {
 
 /* TURN server/port and credentials, if any */
 static char *janus_turn_server = NULL;
+static janus_ice_server_cache janus_turn_server_cache;
 static uint16_t janus_turn_port = 0;
 static char *janus_turn_user = NULL, *janus_turn_pwd = NULL;
 static NiceRelayType janus_turn_type = NICE_RELAY_TYPE_TURN_UDP;
@@ -62,6 +66,144 @@ char *janus_ice_get_turn_server(void) {
 }
 uint16_t janus_ice_get_turn_port(void) {
 	return janus_turn_port;
+}
+
+
+/* Refresh configured ICE server hostnames away from session setup, so old
+ * libnice versions can use updated numeric addresses without blocking users. */
+#define JANUS_ICE_SERVER_REFRESH_INTERVAL 60
+#define JANUS_ICE_SERVER_RESOLVE_TIMEOUT 5
+
+typedef enum janus_ice_server_kind {
+	JANUS_ICE_SERVER_STUN = 0,
+	JANUS_ICE_SERVER_TURN,
+	JANUS_ICE_SERVER_COUNT
+} janus_ice_server_kind;
+
+typedef struct janus_ice_server_resolution {
+	janus_ice_server_kind kind;
+	char *hostname;
+	GCancellable *cancellable;
+	guint timeout_source;
+} janus_ice_server_resolution;
+
+static guint janus_ice_server_refresh_source = 0;
+static janus_ice_server_resolution *janus_ice_server_resolutions[JANUS_ICE_SERVER_COUNT];
+static gboolean janus_ice_server_stopping = FALSE;
+
+static const char *janus_ice_server_kind_name(janus_ice_server_kind kind) {
+	return kind == JANUS_ICE_SERVER_STUN ? "STUN" : "TURN";
+}
+
+static janus_ice_server_cache *janus_ice_server_get_cache(janus_ice_server_kind kind) {
+	return kind == JANUS_ICE_SERVER_STUN ? &janus_stun_server_cache : &janus_turn_server_cache;
+}
+
+static gboolean janus_ice_server_resolution_timeout(gpointer data) {
+	janus_ice_server_resolution *resolution = data;
+	resolution->timeout_source = 0;
+	char *cached = janus_ice_server_cache_dup_address(janus_ice_server_get_cache(resolution->kind));
+	JANUS_LOG(LOG_VERB, "%s server address refresh timed out, keeping the last known address %s\n",
+		janus_ice_server_kind_name(resolution->kind), cached ? cached : "(none)");
+	g_free(cached);
+	g_cancellable_cancel(resolution->cancellable);
+	return G_SOURCE_REMOVE;
+}
+
+static void janus_ice_server_resolved(GObject *source_object, GAsyncResult *result, gpointer data) {
+	janus_ice_server_resolution *resolution = data;
+	if(resolution->timeout_source > 0) {
+		g_source_remove(resolution->timeout_source);
+		resolution->timeout_source = 0;
+	}
+	GError *error = NULL;
+	GList *addresses = g_resolver_lookup_by_name_finish(G_RESOLVER(source_object), result, &error);
+	char *resolved = NULL;
+	if(error == NULL && addresses != NULL) {
+		GSocketFamily current_family = G_SOCKET_FAMILY_INVALID;
+		char *current_address = janus_ice_server_cache_dup_address(
+			janus_ice_server_get_cache(resolution->kind));
+		GInetAddress *current = g_inet_address_new_from_string(current_address);
+		g_free(current_address);
+		if(current != NULL) {
+			current_family = g_inet_address_get_family(current);
+			g_object_unref(current);
+		}
+		for(GList *item = addresses; item != NULL; item = item->next) {
+			GInetAddress *address = item->data;
+			if(current_family == G_SOCKET_FAMILY_INVALID || g_inet_address_get_family(address) == current_family) {
+				resolved = g_inet_address_to_string(address);
+				break;
+			}
+		}
+	}
+	if(!janus_ice_server_stopping) {
+		/* NULL is intentional on failure/timeout: the cache helper keeps the
+		 * last known address, which remains available to new ICE agents. */
+		char *cached = janus_ice_server_cache_dup_address(janus_ice_server_get_cache(resolution->kind));
+		gboolean changed = janus_ice_server_cache_refresh(
+			janus_ice_server_get_cache(resolution->kind), resolution->hostname, resolved);
+		if(changed) {
+			JANUS_LOG(LOG_VERB, "%s server address refreshed: %s changed from %s to %s\n",
+				janus_ice_server_kind_name(resolution->kind), resolution->hostname,
+				cached ? cached : "(none)", resolved);
+		} else if(resolved == NULL &&
+				(error == NULL || !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))) {
+			JANUS_LOG(LOG_VERB, "Could not refresh %s server address, keeping the last known address %s\n",
+				janus_ice_server_kind_name(resolution->kind), cached ? cached : "(none)");
+		}
+		g_free(cached);
+	}
+	g_free(resolved);
+	g_resolver_free_addresses(addresses);
+	g_clear_error(&error);
+	janus_ice_server_resolutions[resolution->kind] = NULL;
+	g_object_unref(resolution->cancellable);
+	g_free(resolution->hostname);
+	g_free(resolution);
+}
+
+static void janus_ice_server_refresh_start(janus_ice_server_kind kind) {
+	if(janus_ice_server_stopping || janus_ice_server_resolutions[kind] != NULL)
+		return;
+	char *hostname = janus_ice_server_cache_dup_hostname(janus_ice_server_get_cache(kind));
+	if(hostname == NULL || janus_network_string_is_valid_address(janus_network_query_options_any_ip, hostname)) {
+		g_free(hostname);
+		return;
+	}
+	janus_ice_server_resolution *resolution = g_malloc0(sizeof(janus_ice_server_resolution));
+	resolution->kind = kind;
+	resolution->hostname = hostname;
+	resolution->cancellable = g_cancellable_new();
+	janus_ice_server_resolutions[kind] = resolution;
+	GResolver *resolver = g_resolver_get_default();
+	g_resolver_lookup_by_name_async(resolver, resolution->hostname, resolution->cancellable,
+		janus_ice_server_resolved, resolution);
+	g_object_unref(resolver);
+	resolution->timeout_source = g_timeout_add_seconds(JANUS_ICE_SERVER_RESOLVE_TIMEOUT,
+		janus_ice_server_resolution_timeout, resolution);
+}
+
+static gboolean janus_ice_server_refresh(gpointer data) {
+	(void)data;
+	janus_ice_server_refresh_start(JANUS_ICE_SERVER_STUN);
+	janus_ice_server_refresh_start(JANUS_ICE_SERVER_TURN);
+	return G_SOURCE_CONTINUE;
+}
+
+static void janus_ice_server_refresh_schedule(void) {
+	char *stun_server_name = janus_ice_server_cache_dup_hostname(&janus_stun_server_cache);
+	char *turn_server_name = janus_ice_server_cache_dup_hostname(&janus_turn_server_cache);
+	gboolean needed = (stun_server_name != NULL &&
+		!janus_network_string_is_valid_address(janus_network_query_options_any_ip, stun_server_name)) ||
+		(turn_server_name != NULL &&
+		!janus_network_string_is_valid_address(janus_network_query_options_any_ip, turn_server_name));
+	g_free(stun_server_name);
+	g_free(turn_server_name);
+	if(needed && janus_ice_server_refresh_source == 0 && !janus_ice_server_stopping) {
+		janus_ice_server_refresh_source = g_timeout_add_seconds(JANUS_ICE_SERVER_REFRESH_INTERVAL,
+			janus_ice_server_refresh, NULL);
+	}
 }
 
 
@@ -1064,6 +1206,21 @@ void janus_ice_init(gboolean ice_lite, gboolean ice_tcp, gboolean full_trickle, 
 }
 
 void janus_ice_deinit(void) {
+	janus_ice_server_stopping = TRUE;
+	if(janus_ice_server_refresh_source > 0) {
+		g_source_remove(janus_ice_server_refresh_source);
+		janus_ice_server_refresh_source = 0;
+	}
+	for(int i = 0; i < JANUS_ICE_SERVER_COUNT; i++) {
+		janus_ice_server_resolution *resolution = janus_ice_server_resolutions[i];
+		if(resolution != NULL) {
+			if(resolution->timeout_source > 0) {
+				g_source_remove(resolution->timeout_source);
+				resolution->timeout_source = 0;
+			}
+			g_cancellable_cancel(resolution->cancellable);
+		}
+	}
 #ifdef HAVE_TURNRESTAPI
 	janus_turnrest_deinit();
 #endif
@@ -1222,30 +1379,34 @@ int janus_ice_set_stun_server(gchar *stun_server, uint16_t stun_port) {
 		return -1;
 	}
 	freeaddrinfo(res);
-	janus_stun_server = g_strdup(janus_network_address_string_from_buffer(&addr_buf));
-	if(janus_stun_server == NULL) {
+	char *resolved_server = g_strdup(janus_network_address_string_from_buffer(&addr_buf));
+	if(resolved_server == NULL) {
 		JANUS_LOG(LOG_ERR, "Could not resolve %s...\n", stun_server);
+		g_free(resolved_server);
 		return -1;
 	}
-	janus_stun_port = stun_port;
-	JANUS_LOG(LOG_INFO, "  >> %s:%u (%s)\n", janus_stun_server, janus_stun_port, addr.family == AF_INET ? "IPv4" : "IPv6");
+	JANUS_LOG(LOG_INFO, "  >> %s:%u (%s)\n", resolved_server, stun_port, addr.family == AF_INET ? "IPv4" : "IPv6");
 
 	/* Test the STUN server */
 	janus_network_address public_addr = { 0 };
-	if(janus_ice_test_stun_server(&addr, janus_stun_port, 0, &public_addr, NULL) < 0) {
-		g_free(janus_stun_server);
-		janus_stun_server = NULL;
+	if(janus_ice_test_stun_server(&addr, stun_port, 0, &public_addr, NULL) < 0) {
+		g_free(resolved_server);
 		return -1;
 	}
 	if(janus_network_address_to_string_buffer(&public_addr, &addr_buf) != 0) {
 		JANUS_LOG(LOG_ERR, "Could not resolve public address...\n");
-		g_free(janus_stun_server);
-		janus_stun_server = NULL;
+		g_free(resolved_server);
 		return -1;
 	}
 	const char *public_ip = janus_network_address_string_from_buffer(&addr_buf);
 	JANUS_LOG(LOG_INFO, "  >> Our public address is %s\n", public_ip);
 	janus_add_public_ip(public_ip);
+	g_free(janus_stun_server);
+	janus_stun_server = g_strdup(resolved_server);
+	janus_ice_server_cache_set(&janus_stun_server_cache, stun_server, resolved_server);
+	janus_stun_port = stun_port;
+	g_free(resolved_server);
+	janus_ice_server_refresh_schedule();
 	return 0;
 }
 
@@ -1257,12 +1418,13 @@ int janus_ice_set_turn_server(gchar *turn_server, uint16_t turn_port, gchar *tur
 	if(turn_port == 0)
 		turn_port = 3478;
 	JANUS_LOG(LOG_INFO, "TURN server to use: %s:%u (%s)\n", turn_server, turn_port, turn_type);
+	NiceRelayType relay_type = NICE_RELAY_TYPE_TURN_UDP;
 	if(!strcasecmp(turn_type, "udp")) {
-		janus_turn_type = NICE_RELAY_TYPE_TURN_UDP;
+		relay_type = NICE_RELAY_TYPE_TURN_UDP;
 	} else if(!strcasecmp(turn_type, "tcp")) {
-		janus_turn_type = NICE_RELAY_TYPE_TURN_TCP;
+		relay_type = NICE_RELAY_TYPE_TURN_TCP;
 	} else if(!strcasecmp(turn_type, "tls")) {
-		janus_turn_type = NICE_RELAY_TYPE_TURN_TLS;
+		relay_type = NICE_RELAY_TYPE_TURN_TLS;
 	} else {
 		JANUS_LOG(LOG_ERR, "Unsupported relay type '%s'...\n", turn_type);
 		return -1;
@@ -1280,14 +1442,19 @@ int janus_ice_set_turn_server(gchar *turn_server, uint16_t turn_port, gchar *tur
 		return -1;
 	}
 	freeaddrinfo(res);
-	g_free(janus_turn_server);
-	janus_turn_server = g_strdup(janus_network_address_string_from_buffer(&addr_buf));
-	if(janus_turn_server == NULL) {
+	char *resolved_server = g_strdup(janus_network_address_string_from_buffer(&addr_buf));
+	if(resolved_server == NULL) {
 		JANUS_LOG(LOG_ERR, "Could not resolve %s...\n", turn_server);
+		g_free(resolved_server);
 		return -1;
 	}
+	g_free(janus_turn_server);
+	janus_turn_server = g_strdup(resolved_server);
+	janus_ice_server_cache_set(&janus_turn_server_cache, turn_server, resolved_server);
 	janus_turn_port = turn_port;
+	g_free(resolved_server);
 	JANUS_LOG(LOG_VERB, "  >> %s:%u\n", janus_turn_server, janus_turn_port);
+	janus_turn_type = relay_type;
 	g_free(janus_turn_user);
 	janus_turn_user = NULL;
 	if(turn_user)
@@ -1296,6 +1463,7 @@ int janus_ice_set_turn_server(gchar *turn_server, uint16_t turn_port, gchar *tur
 	janus_turn_pwd = NULL;
 	if(turn_pwd)
 		janus_turn_pwd = g_strdup(turn_pwd);
+	janus_ice_server_refresh_schedule();
 	return 0;
 }
 
@@ -3624,12 +3792,15 @@ int janus_ice_setup_local(janus_ice_handle *handle, gboolean offer, gboolean tri
 	handle->srtp_errors_count = 0;
 	handle->last_srtp_error = 0;
 	/* Any STUN server to use? */
-	if(janus_stun_server != NULL && janus_stun_port > 0) {
+	char *stun_server = janus_stun_server == NULL ? NULL :
+		janus_ice_server_cache_dup_address(&janus_stun_server_cache);
+	if(stun_server != NULL && janus_stun_port > 0) {
 		g_object_set(G_OBJECT(handle->agent),
-			"stun-server", janus_stun_server,
+			"stun-server", stun_server,
 			"stun-server-port", janus_stun_port,
 			NULL);
 	}
+	g_free(stun_server);
 	/* Any dynamic TURN credentials to retrieve via REST API? */
 	gboolean have_turnrest_credentials = FALSE;
 #ifdef HAVE_TURNRESTAPI
@@ -3759,15 +3930,18 @@ int janus_ice_setup_local(janus_ice_handle *handle, gboolean offer, gboolean tri
 	janus_mutex_init(&pc->mutex);
 	if(!have_turnrest_credentials) {
 		/* No TURN REST API server and credentials, any static ones? */
-		if(janus_turn_server != NULL) {
+		char *turn_server = janus_turn_server == NULL ? NULL :
+			janus_ice_server_cache_dup_address(&janus_turn_server_cache);
+		if(turn_server != NULL) {
 			/* We need relay candidates as well */
 			gboolean ok = nice_agent_set_relay_info(handle->agent, handle->stream_id, 1,
-				janus_turn_server, janus_turn_port, janus_turn_user, janus_turn_pwd, janus_turn_type);
+				turn_server, janus_turn_port, janus_turn_user, janus_turn_pwd, janus_turn_type);
 			if(!ok) {
 				JANUS_LOG(LOG_WARN, "Could not set TURN server, is the address correct? (%s:%"SCNu16")\n",
-					janus_turn_server, janus_turn_port);
+					turn_server, janus_turn_port);
 			}
 		}
+		g_free(turn_server);
 #ifdef HAVE_TURNRESTAPI
 	} else {
 		/* We need relay candidates as well: add all those we got */
