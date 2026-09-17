@@ -9471,6 +9471,7 @@ static size_t janus_streaming_rtsp_interleave_cb(char *ptr, size_t size, size_t 
 				gint64 now = janus_get_monotonic_time();
 #ifdef HAVE_LIBCURL
 				source->reconnect_timer = now;
+				source->reconnect_at = 0;
 #endif
 
 				janus_streaming_handle_rtp_packet_audio(name, mountpoint, source, stream, (char*)payload, (int)plen, now, index) ;
@@ -9482,6 +9483,7 @@ static size_t janus_streaming_rtsp_interleave_cb(char *ptr, size_t size, size_t 
 				gint64 now = janus_get_monotonic_time();					
 	#ifdef HAVE_LIBCURL
 				source->reconnect_timer = now;
+				source->reconnect_at = 0;
 	#endif
 
 				janus_streaming_handle_rtp_packet_video(name, mountpoint, source, stream, (char*)payload, (int)plen, now, index);
@@ -9495,6 +9497,7 @@ static size_t janus_streaming_rtsp_interleave_cb(char *ptr, size_t size, size_t 
 				stream->last_received[0] = now;
 	#ifdef HAVE_LIBCURL
 				source->reconnect_timer = now;
+				source->reconnect_at = 0;
 	#endif
 				janus_streaming_handle_rtp_packet_data(name, mountpoint, source, stream, (char*)payload, (int)plen, now, index);
 			}
@@ -11182,6 +11185,7 @@ static void *janus_streaming_relay_thread(void *data) {
 #ifdef HAVE_LIBCURL
 		/* Let's check regularly if the RTSP server seems to be gone */
 		if(source->rtsp) {
+			gboolean reconnect_media_ready = FALSE;
 			if(source->reconnecting) {
 				/* We're still reconnecting, wait some more */
 				g_usleep(250000);
@@ -11194,10 +11198,40 @@ static void *janus_streaming_relay_thread(void *data) {
 			}
 			if(!source->reconnecting && source->reconnect_at > now) {
 				gint64 wait = MIN(source->reconnect_at - now, 250000);
-				g_usleep(wait);
-				continue;
+				if(source->rtsp_tcp) {
+					/* An interleaved RTCP packet can make CURL_RTSPREQ_RECEIVE
+					 * return while RTP is temporarily paused. Keep servicing the
+					 * TCP socket during the reconnect grace period, otherwise the
+					 * resumed media is left queued and triggers a false reconnect. */
+					curl_socket_t active_socket = CURL_SOCKET_BAD;
+					janus_mutex_lock(&source->rtsp_mutex);
+					if(source->curl != NULL)
+						curl_easy_getinfo(source->curl, CURLINFO_ACTIVESOCKET, &active_socket);
+					janus_mutex_unlock(&source->rtsp_mutex);
+					if(active_socket != CURL_SOCKET_BAD) {
+						struct pollfd pending = {
+							.fd = (int)active_socket,
+							.events = POLLIN,
+							.revents = 0
+						};
+						int wait_ms = (int)((wait + 999) / 1000);
+						int polled = poll(&pending, 1, wait_ms);
+						if(polled > 0 && (pending.revents & POLLIN))
+							reconnect_media_ready = TRUE;
+						else if(polled < 0 && errno != EINTR)
+							source->reconnect_at = now;
+					} else {
+						g_usleep(wait);
+					}
+				} else {
+					g_usleep(wait);
+				}
+				if(!reconnect_media_ready)
+					continue;
 			}
-			if(!source->reconnecting && source->reconnect_at > 0) {
+			now = janus_get_monotonic_time();
+			if(!source->reconnecting && !reconnect_media_ready &&
+					source->reconnect_at > 0 && source->reconnect_at <= now) {
 				/*  Assume the RTSP server has gone and schedule a reconnect */
 				g_atomic_int_inc(&source->rtsp_no_media_count);
 				JANUS_LOG(LOG_WARN, "[%s] %"SCNi64"s passed with no media, trying to reconnect the RTSP stream\n",
